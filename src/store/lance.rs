@@ -165,6 +165,56 @@ impl Store {
         self.processed.add(Box::new(batches)).execute().await?;
         Ok(())
     }
+
+    /// Get a node by ID
+    pub async fn get_node(&self, id: Uuid) -> Result<Option<Node>, lancedb::Error> {
+        let filter = format!("id = '{}'", id);
+
+        let mut results = self
+            .nodes
+            .query()
+            .only_if(filter)
+            .limit(1)
+            .execute()
+            .await?;
+
+        if let Some(batch) = results.try_next().await? {
+            let nodes = batch_to_nodes(&batch)?;
+            Ok(nodes.into_iter().next())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Count total nodes in the store
+    pub async fn count_nodes(&self) -> Result<usize, lancedb::Error> {
+        self.nodes.count_rows(None).await
+    }
+
+    /// Get an edge by ID
+    pub async fn get_edge(&self, id: Uuid) -> Result<Option<Edge>, lancedb::Error> {
+        let filter = format!("id = '{}'", id);
+
+        let mut results = self
+            .edges
+            .query()
+            .only_if(filter)
+            .limit(1)
+            .execute()
+            .await?;
+
+        if let Some(batch) = results.try_next().await? {
+            let edges = batch_to_edges(&batch)?;
+            Ok(edges.into_iter().next())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Count total edges in the store
+    pub async fn count_edges(&self) -> Result<usize, lancedb::Error> {
+        self.edges.count_rows(None).await
+    }
 }
 
 fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {
