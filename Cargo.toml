@@ -1,0 +1,43 @@
+[package]
+name = "engram"
+version = "0.1.0"
+edition = "2024"
+description = "Background daemon that distills and links knowledge from local sources"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/cloud-atlas-ai/engram"
+
+[[bin]]
+name = "engram"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time
+chrono = { version = "0.4.42", features = ["serde"] }
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Storage (LanceDB) - must match arrow version lancedb uses
+lancedb = "0.23.1"
+arrow-array = "56"
+arrow-schema = "56"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+futures = "0.3"
+
+# File watching
+notify = "8.2.0"
+
+# Paths
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
