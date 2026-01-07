@@ -721,6 +721,80 @@ async fn run_query(
     Ok(())
 }
 
+/// Run related command - find nodes similar to a given node
+async fn run_related(
+    node_id: &str,
+    limit: usize,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db_path = default_db_path();
+
+    if !db_path.exists() {
+        eprintln!("Database not found at: {}", db_path.display());
+        return Ok(());
+    }
+
+    // Parse node ID as UUID
+    let uuid = node_id.parse::<Uuid>().map_err(|_| {
+        format!("Invalid node ID: {}. Expected a UUID.", node_id)
+    })?;
+
+    let store = Store::open(db_path.to_str().unwrap()).await?;
+
+    // Get the source node
+    let node = store.get_node(uuid).await?.ok_or_else(|| {
+        format!("Node not found: {}", node_id)
+    })?;
+
+    // Search for similar nodes (request one extra to filter out self)
+    let results = store.search_similar_with_scores(&node.embedding, limit + 1).await?;
+
+    // Filter out the source node itself
+    let results: Vec<_> = results
+        .into_iter()
+        .filter(|(n, _)| n.id != uuid)
+        .take(limit)
+        .collect();
+
+    if results.is_empty() {
+        if format == "json" {
+            println!("[]");
+        } else {
+            println!("No related nodes found.");
+        }
+        return Ok(());
+    }
+
+    if format == "json" {
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(n, score)| {
+                serde_json::json!({
+                    "id": n.id.to_string(),
+                    "content": n.content,
+                    "source": n.source,
+                    "similarity": score,
+                    "timestamp": n.timestamp.to_rfc3339(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_results)?);
+    } else {
+        println!("Nodes related to {}:", &node_id[..8.min(node_id.len())]);
+        println!();
+        for (i, (n, score)) in results.iter().enumerate() {
+            println!("─── {} (similarity: {:.2}) ───", i + 1, score);
+            println!("ID:     {}", n.id);
+            println!("Source: {}", n.source);
+            println!("Time:   {}", n.timestamp.format("%Y-%m-%d %H:%M"));
+            println!("{}", n.content);
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -814,6 +888,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Query { query, limit, format } => {
             run_query(&query, limit, &format).await?;
+        }
+
+        Commands::Related { node_id, limit, format } => {
+            run_related(&node_id, limit, &format).await?;
         }
     }
 
