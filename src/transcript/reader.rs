@@ -190,8 +190,25 @@ fn tool_summary(name: &str, input: Option<&serde_json::Value>) -> String {
     }
 }
 
+/// Options for formatting transcript context
+/// AIDEV-NOTE: tool_results and thinking are disabled by default because they
+/// can be huge (full file contents, verbose reasoning) and blow up context size.
+#[derive(Default)]
+pub struct FormatOptions {
+    /// Include full tool results (file contents, grep output, etc.)
+    pub include_tool_results: bool,
+    /// Include Claude's thinking blocks
+    pub include_thinking: bool,
+}
+
 /// Format messages for context (for sending to extraction LLM)
+/// Uses default options (no tool_results, no thinking) for compact output.
 pub fn format_context(messages: &[&TranscriptEntry]) -> String {
+    format_context_with_options(messages, &FormatOptions::default())
+}
+
+/// Format messages for context with custom options
+pub fn format_context_with_options(messages: &[&TranscriptEntry], options: &FormatOptions) -> String {
     let mut output = String::new();
 
     for entry in messages {
@@ -204,9 +221,9 @@ pub fn format_context(messages: &[&TranscriptEntry]) -> String {
                 }
             }
             TranscriptEntry::User { .. } => {
-                // Include tool results (what Claude read/executed)
-                let tool_results = entry.tool_results();
-                if !tool_results.is_empty() {
+                // Include tool results only if requested (can be huge)
+                if options.include_tool_results {
+                    let tool_results = entry.tool_results();
                     for (_id, content) in &tool_results {
                         output.push_str("TOOL_RESULT: ");
                         output.push_str(content);
@@ -226,11 +243,13 @@ pub fn format_context(messages: &[&TranscriptEntry]) -> String {
             TranscriptEntry::Assistant { .. } => {
                 let tool_uses = entry.tool_uses();
 
-                // Include thinking if present (shows Claude's reasoning)
-                if let Some(thinking) = entry.assistant_thinking() {
-                    output.push_str("THINKING: ");
-                    output.push_str(&thinking);
-                    output.push_str("\n\n");
+                // Include thinking only if requested (can be verbose)
+                if options.include_thinking {
+                    if let Some(thinking) = entry.assistant_thinking() {
+                        output.push_str("THINKING: ");
+                        output.push_str(&thinking);
+                        output.push_str("\n\n");
+                    }
                 }
 
                 if !tool_uses.is_empty() {
