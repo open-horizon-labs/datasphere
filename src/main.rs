@@ -53,6 +53,20 @@ enum Commands {
         /// Path to the file to add
         file: PathBuf,
     },
+
+    /// Search the knowledge graph for relevant nodes
+    Query {
+        /// Search query text
+        query: String,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+
+        /// Output format (text or json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -657,6 +671,65 @@ fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// Run query command - search knowledge graph
+async fn run_query(
+    query: &str,
+    limit: usize,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db_path = default_db_path();
+
+    if !db_path.exists() {
+        eprintln!("Database not found at: {}", db_path.display());
+        return Ok(());
+    }
+
+    let store = Store::open(db_path.to_str().unwrap()).await?;
+
+    // Embed the query
+    let embedding = embed(query).await?;
+
+    // Search for similar nodes
+    let results = store.search_similar_with_scores(&embedding, limit).await?;
+
+    if results.is_empty() {
+        if format == "json" {
+            println!("[]");
+        } else {
+            println!("No relevant results found.");
+        }
+        return Ok(());
+    }
+
+    if format == "json" {
+        // JSON output for MCP consumption
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(node, score)| {
+                serde_json::json!({
+                    "id": node.id.to_string(),
+                    "content": node.content,
+                    "source": node.source,
+                    "similarity": score,
+                    "timestamp": node.timestamp.to_rfc3339(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_results)?);
+    } else {
+        // Human-readable text output
+        for (i, (node, score)) in results.iter().enumerate() {
+            println!("─── Result {} (similarity: {:.2}) ───", i + 1, score);
+            println!("Source: {}", node.source);
+            println!("Time:   {}", node.timestamp.format("%Y-%m-%d %H:%M"));
+            println!("{}", node.content);
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -748,6 +821,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Error: {}", e);
                 }
             }
+        }
+
+        Commands::Query { query, limit, format } => {
+            run_query(&query, limit, &format).await?;
         }
     }
 

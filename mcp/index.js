@@ -1,0 +1,127 @@
+#!/usr/bin/env node
+/**
+ * Engram MCP Server
+ *
+ * Minimal MCP server that exposes engram_query tool.
+ * Shells out to `engram query` CLI command.
+ */
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
+import { execSync } from 'child_process';
+
+const SERVER_INSTRUCTIONS = `
+Engram MCP Server - Knowledge Graph Queries
+
+Use engram_query to search your distilled knowledge graph for relevant insights.
+The knowledge graph contains extracted learnings from your Claude Code sessions.
+
+Example queries:
+- "How do I configure LanceDB?"
+- "What's the pattern for chunking large texts?"
+- "Authentication strategies we've discussed"
+`.trim();
+
+const server = new Server(
+  { name: 'engram', version: '0.1.0' },
+  {
+    capabilities: { tools: {} },
+    instructions: SERVER_INSTRUCTIONS
+  }
+);
+
+// Define the single tool
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'engram_query',
+      description: 'Search the engram knowledge graph for relevant insights from past sessions',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'Search query - describe what you\'re looking for'
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum number of results (default: 5)',
+            default: 5
+          }
+        },
+        required: ['query']
+      }
+    }
+  ]
+}));
+
+// Handle tool calls
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  if (name !== 'engram_query') {
+    return {
+      content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+      isError: true
+    };
+  }
+
+  const { query, limit = 5 } = args;
+
+  try {
+    // Shell out to engram query command
+    const result = execSync(
+      `engram query --format json --limit ${limit} ${JSON.stringify(query)}`,
+      { encoding: 'utf-8', timeout: 30000 }
+    );
+
+    const nodes = JSON.parse(result);
+
+    if (nodes.length === 0) {
+      return {
+        content: [{
+          type: 'text',
+          text: 'No relevant results found in the knowledge graph.'
+        }]
+      };
+    }
+
+    // Format results for Claude
+    const formatted = nodes.map((node, i) =>
+      `## Result ${i + 1} (similarity: ${node.similarity.toFixed(2)})\n` +
+      `Source: ${node.source}\n` +
+      `Time: ${node.timestamp}\n\n` +
+      `${node.content}`
+    ).join('\n\n---\n\n');
+
+    return {
+      content: [{
+        type: 'text',
+        text: formatted
+      }]
+    };
+
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return {
+      content: [{ type: 'text', text: `Error querying engram: ${message}` }],
+      isError: true
+    };
+  }
+});
+
+// Start server
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('Engram MCP server running on stdio');
+}
+
+main().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});
