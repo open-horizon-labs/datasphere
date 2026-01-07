@@ -197,41 +197,41 @@ async fn process_session(
         println!("  Used {} chunks for distillation", extraction.chunks_used);
     }
 
-    let insight = match extraction.insight {
-        Some(insight) => insight,
-        None => {
-            println!("  No substantive knowledge found");
-            // Still record as processed
-            let record = Processed {
-                source_id: session.session_id.clone(),
-                source_type: "session".to_string(),
-                simhash: current_simhash,
-                processed_at: Utc::now(),
-                node_count: 0,
-                node_ids: Vec::new(),
-            };
-            store.insert_processed(&record).await?;
-            return Ok((0, false));
-        }
-    };
+    if extraction.insights.is_empty() {
+        println!("  No substantive knowledge found");
+        // Still record as processed
+        let record = Processed {
+            source_id: session.session_id.clone(),
+            source_type: "session".to_string(),
+            simhash: current_simhash,
+            processed_at: Utc::now(),
+            node_count: 0,
+            node_ids: Vec::new(),
+        };
+        store.insert_processed(&record).await?;
+        return Ok((0, false));
+    }
 
-    println!("  Extracted insight: {} chars", insight.content.len());
+    println!("  Extracted {} insight(s)", extraction.insights.len());
 
-    // Generate embedding
-    println!("  Generating embedding...");
-    let embedding = embed(&insight.content).await?;
-    println!("  Embedding: {} dimensions", embedding.len());
+    // Embed and store each insight as a separate node
+    let total_insights = extraction.insights.len();
+    let mut node_ids = Vec::new();
+    for (i, insight) in extraction.insights.into_iter().enumerate() {
+        println!("  Embedding insight {}/{}...", i + 1, total_insights);
+        let embedding = embed(&insight.content).await?;
 
-    // Create and store node
-    let node = insight.into_node(
-        session.session_id.clone(),
-        SourceType::Session,
-        embedding,
-    );
-    let node_id = node.id.to_string();
+        let node = insight.into_node(
+            session.session_id.clone(),
+            SourceType::Session,
+            embedding,
+        );
+        let node_id = node.id.to_string();
 
-    println!("  Storing node {}...", &node_id[..8]);
-    store.insert_node(&node).await?;
+        println!("  Storing node {}...", &node_id[..8]);
+        store.insert_node(&node).await?;
+        node_ids.push(node_id);
+    }
 
     // Record as processed
     let record = Processed {
@@ -239,13 +239,13 @@ async fn process_session(
         source_type: "session".to_string(),
         simhash: current_simhash,
         processed_at: Utc::now(),
-        node_count: 1,
-        node_ids: vec![node_id],
+        node_count: node_ids.len() as i32,
+        node_ids,
     };
     store.insert_processed(&record).await?;
 
-    println!("  Done!");
-    Ok((1, false))
+    println!("  Done! Created {} node(s)", record.node_count);
+    Ok((record.node_count as usize, false))
 }
 
 /// Process a single text file (no LLM distillation, direct embedding)

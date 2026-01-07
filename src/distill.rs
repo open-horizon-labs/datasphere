@@ -76,27 +76,28 @@ fn chunk_transcript(transcript: &str) -> Vec<String> {
 
 /// Result of extraction with metadata about chunking
 pub struct ExtractionResult {
-    pub insight: Option<ExtractedInsight>,
+    /// All extracted insights (one per chunk, or single for small transcripts)
+    pub insights: Vec<ExtractedInsight>,
     pub chunks_used: usize,
 }
 
 /// Extract knowledge from a formatted transcript
 ///
-/// Returns a single ExtractedInsight containing the full LLM distillation,
-/// or None if no knowledge worth capturing was found.
+/// Returns ExtractedInsights - one per chunk for large transcripts,
+/// or a single insight for small ones.
 ///
-/// For large transcripts, chunks semantically, distills each chunk
-/// in parallel (up to 4 concurrent), then synthesizes into one summary.
+/// For large transcripts, chunks semantically and distills each chunk
+/// in parallel (up to 4 concurrent). Each chunk becomes a separate node.
 ///
 /// # Arguments
 /// * `transcript` - Formatted transcript text (from format_context)
 ///
 /// # Returns
-/// ExtractionResult with insight (if found) and chunk count
+/// ExtractionResult with insights (may be empty) and chunk count
 pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, String> {
     if transcript.trim().is_empty() {
         return Ok(ExtractionResult {
-            insight: None,
+            insights: Vec::new(),
             chunks_used: 0,
         });
     }
@@ -109,22 +110,23 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, Str
         let content = content.trim().to_string();
 
         if content.len() < MIN_CONTENT_LEN {
+            eprintln!("    Distillation too short ({} chars < {}), skipping", content.len(), MIN_CONTENT_LEN);
             return Ok(ExtractionResult {
-                insight: None,
+                insights: Vec::new(),
                 chunks_used: 1,
             });
         }
 
         return Ok(ExtractionResult {
-            insight: Some(ExtractedInsight {
+            insights: vec![ExtractedInsight {
                 content,
                 confidence: 1.0,
-            }),
+            }],
             chunks_used: 1,
         });
     }
 
-    // Large transcript: chunk → distill in parallel → synthesize
+    // Large transcript: chunk → distill in parallel (no synthesis)
     let chunks = chunk_transcript(transcript);
     let chunk_count = chunks.len();
 
@@ -144,57 +146,47 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, Str
         .await;
 
     // Collect successful distillations (preserving order for consistency)
-    let mut indexed_distillations: Vec<(usize, String)> = chunk_results
-        .into_iter()
-        .filter_map(|(i, result)| {
-            match result {
-                Ok(distillation) => {
-                    let trimmed = distillation.trim();
-                    if !trimmed.is_empty() && trimmed.len() >= MIN_CONTENT_LEN {
-                        Some((i, distillation))
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => {
-                    eprintln!("    Warning: chunk {} failed: {}", i + 1, e);
-                    None
+    let mut indexed_distillations: Vec<(usize, String)> = Vec::new();
+    let mut dropped_count = 0;
+
+    for (i, result) in chunk_results {
+        match result {
+            Ok(distillation) => {
+                let trimmed = distillation.trim();
+                if !trimmed.is_empty() && trimmed.len() >= MIN_CONTENT_LEN {
+                    indexed_distillations.push((i, distillation));
+                } else {
+                    dropped_count += 1;
+                    eprintln!("    Chunk {} distillation too short ({} chars), skipping", i + 1, trimmed.len());
                 }
             }
-        })
-        .collect();
+            Err(e) => {
+                dropped_count += 1;
+                eprintln!("    Warning: chunk {} failed: {}", i + 1, e);
+            }
+        }
+    }
+
+    if dropped_count > 0 {
+        eprintln!("    Dropped {} of {} chunks", dropped_count, chunk_count);
+    }
 
     // Sort by original chunk order
     indexed_distillations.sort_by_key(|(i, _)| *i);
-    let chunk_distillations: Vec<String> = indexed_distillations.into_iter().map(|(_, d)| d).collect();
 
-    if chunk_distillations.is_empty() {
-        return Ok(ExtractionResult {
-            insight: None,
-            chunks_used: chunk_count,
-        });
-    }
+    // Convert to insights (no synthesis - each chunk becomes its own node)
+    let insights: Vec<ExtractedInsight> = indexed_distillations
+        .into_iter()
+        .map(|(_, content)| ExtractedInsight {
+            content,
+            confidence: 1.0,
+        })
+        .collect();
 
-    // Synthesize chunk distillations into final summary
-    eprintln!(
-        "    Synthesizing {} chunk distillations...",
-        chunk_distillations.len()
-    );
-    let synthesized = call_synthesis_llm(&chunk_distillations).await?;
-    let synthesized = synthesized.trim().to_string();
-
-    if synthesized.len() < MIN_CONTENT_LEN {
-        return Ok(ExtractionResult {
-            insight: None,
-            chunks_used: chunk_count,
-        });
-    }
+    eprintln!("    Extracted {} insights from {} chunks", insights.len(), chunk_count);
 
     Ok(ExtractionResult {
-        insight: Some(ExtractedInsight {
-            content: synthesized,
-            confidence: 1.0,
-        }),
+        insights,
         chunks_used: chunk_count,
     })
 }
@@ -245,28 +237,6 @@ If the session has no substantive knowledge, just say so briefly."#;
     llm::call_claude(system_prompt, &message).await
 }
 
-/// Call LLM to synthesize multiple chunk distillations into one summary
-async fn call_synthesis_llm(distillations: &[String]) -> Result<String, String> {
-    let system_prompt = r#"You are synthesizing knowledge summaries from multiple chunks of an AI coding session.
-
-Each chunk summary below was extracted from a different part of the same session transcript.
-
-Your task:
-1. Combine the insights into a single coherent summary
-2. Remove redundant or duplicate information
-3. Preserve all unique knowledge, decisions, concepts, and questions
-4. Organize by theme rather than by chunk order
-5. Keep the same format (prose, bullets, headers) as appropriate
-
-The result should read as if it was extracted from the whole session at once, not as a collection of separate summaries."#;
-
-    let mut message = String::from("CHUNK SUMMARIES:\n\n");
-    for (i, distillation) in distillations.iter().enumerate() {
-        message.push_str(&format!("--- Chunk {} ---\n{}\n\n", i + 1, distillation));
-    }
-
-    llm::call_claude(system_prompt, &message).await
-}
 
 #[cfg(test)]
 mod tests {
@@ -293,11 +263,11 @@ mod tests {
     #[tokio::test]
     async fn test_extract_knowledge_empty_transcript() {
         let result = extract_knowledge("").await.unwrap();
-        assert!(result.insight.is_none());
+        assert!(result.insights.is_empty());
         assert_eq!(result.chunks_used, 0);
 
         let result = extract_knowledge("   ").await.unwrap();
-        assert!(result.insight.is_none());
+        assert!(result.insights.is_empty());
         assert_eq!(result.chunks_used, 0);
     }
 }
