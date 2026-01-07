@@ -3,7 +3,8 @@
 //! AIDEV-NOTE: Adapted from wm/src/llm.rs. Engram uses same pattern:
 //! call Claude CLI with a system prompt, parse response using text markers.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tokio::process::Command;
 
 /// Result of calling the LLM with a marker-based response format
 #[derive(Debug)]
@@ -15,49 +16,11 @@ pub struct MarkerResponse {
     pub content: String,
 }
 
-/// Drop guard that restores an environment variable when dropped
-/// AIDEV-NOTE: Ensures env vars are restored even if the LLM call panics.
-/// Prevents recursion when engram calls Claude CLI.
-struct EnvGuard {
-    var_name: &'static str,
-    original_value: Option<String>,
-}
-
-impl EnvGuard {
-    fn new(var_name: &'static str, value: &str) -> Self {
-        let original_value = std::env::var(var_name).ok();
-        // SAFETY: Single-threaded, setting recursion prevention flag
-        unsafe { std::env::set_var(var_name, value) };
-        Self {
-            var_name,
-            original_value,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: Single-threaded, restoring previous state
-        match &self.original_value {
-            Some(val) => unsafe { std::env::set_var(self.var_name, val) },
-            None => unsafe { std::env::remove_var(self.var_name) },
-        }
-    }
-}
-
-/// Call Claude CLI with a system prompt and message
+/// Call Claude CLI with a system prompt and message (async)
 ///
 /// Returns the raw result string from the Claude CLI JSON response.
 /// Sets WM_DISABLED and SUPEREGO_DISABLED to prevent recursion.
-pub fn call_claude(system_prompt: &str, message: &str) -> Result<String, String> {
-    // Prevent recursion using drop guards
-    let _wm_guard = EnvGuard::new("WM_DISABLED", "1");
-    let _sg_guard = EnvGuard::new("SUPEREGO_DISABLED", "1");
-
-    call_claude_inner(system_prompt, message)
-}
-
-fn call_claude_inner(system_prompt: &str, message: &str) -> Result<String, String> {
+pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, String> {
     let mut cmd = Command::new("claude");
     cmd.arg("-p")
         .arg("--output-format")
@@ -68,15 +31,14 @@ fn call_claude_inner(system_prompt: &str, message: &str) -> Result<String, Strin
         .arg(message)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .env("WM_DISABLED", "1")
+        .env("SUPEREGO_DISABLED", "1");
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn claude CLI: {}", e))?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for claude CLI: {}", e))?;
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run claude CLI: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

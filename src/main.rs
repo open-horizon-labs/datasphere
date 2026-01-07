@@ -176,7 +176,7 @@ async fn process_session(
 
     // Distill knowledge via LLM
     println!("  Distilling via LLM...");
-    let extraction = match extract_knowledge(&context) {
+    let extraction = match extract_knowledge(&context).await {
         Ok(result) => result,
         Err(e) => {
             eprintln!("  LLM extraction failed: {}", e);
