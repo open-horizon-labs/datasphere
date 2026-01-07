@@ -164,7 +164,13 @@ fn strip_system_reminders(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Extract filename from a path (last component)
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// Extract key identifier from tool input (file path, command, pattern)
+/// Paths are shortened to basename to reduce tokens
 fn tool_summary(name: &str, input: Option<&serde_json::Value>) -> String {
     let input = match input {
         Some(v) => v,
@@ -174,6 +180,7 @@ fn tool_summary(name: &str, input: Option<&serde_json::Value>) -> String {
         "Edit" | "Write" | "Read" => input
             .get("file_path")
             .and_then(|v| v.as_str())
+            .map(basename)
             .unwrap_or("")
             .to_string(),
         "Bash" => input
@@ -208,16 +215,20 @@ pub fn format_context(messages: &[&TranscriptEntry]) -> String {
 }
 
 /// Format messages for context with custom options
+/// AIDEV-NOTE: Uses compact prefixes to reduce tokens. Legend added at top.
 pub fn format_context_with_options(messages: &[&TranscriptEntry], options: &FormatOptions) -> String {
     let mut output = String::new();
+
+    // Legend for compact prefixes
+    output.push_str("[U=User A=Assistant T=Tools S=Summary R=Result TH=Thinking E=Edit W=Write B=Bash]\n");
 
     for entry in messages {
         match entry {
             TranscriptEntry::Summary { .. } => {
                 if let Some(text) = entry.summary_text() {
-                    output.push_str("SUMMARY: ");
+                    output.push_str("S: ");
                     output.push_str(text);
-                    output.push_str("\n\n");
+                    output.push('\n');
                 }
             }
             TranscriptEntry::User { .. } => {
@@ -225,18 +236,18 @@ pub fn format_context_with_options(messages: &[&TranscriptEntry], options: &Form
                 if options.include_tool_results {
                     let tool_results = entry.tool_results();
                     for (_id, content) in &tool_results {
-                        output.push_str("TOOL_RESULT: ");
+                        output.push_str("R: ");
                         output.push_str(content);
-                        output.push_str("\n\n");
+                        output.push('\n');
                     }
                 }
 
                 if let Some(text) = entry.user_text() {
                     let cleaned = strip_system_reminders(&text);
                     if !cleaned.is_empty() {
-                        output.push_str("USER: ");
+                        output.push_str("U: ");
                         output.push_str(&cleaned);
-                        output.push_str("\n\n");
+                        output.push('\n');
                     }
                 }
             }
@@ -246,16 +257,30 @@ pub fn format_context_with_options(messages: &[&TranscriptEntry], options: &Form
                 // Include thinking only if requested (can be verbose)
                 if options.include_thinking {
                     if let Some(thinking) = entry.assistant_thinking() {
-                        output.push_str("THINKING: ");
+                        output.push_str("TH: ");
                         output.push_str(&thinking);
-                        output.push_str("\n\n");
+                        output.push('\n');
                     }
                 }
 
-                if !tool_uses.is_empty() {
-                    output.push_str("TOOLS: ");
-                    for (name, input) in &tool_uses {
-                        output.push_str(name);
+                // Only include mutation tools (Edit, Write, Bash) - skip read-only tools
+                // (Read, Grep, Glob, LS, etc.) since knowledge is in the assistant's analysis
+                let mutation_tools: Vec<_> = tool_uses
+                    .iter()
+                    .filter(|(name, _)| matches!(*name, "Edit" | "Write" | "Bash"))
+                    .collect();
+
+                if !mutation_tools.is_empty() {
+                    output.push_str("T: ");
+                    for (name, input) in mutation_tools {
+                        // Compress tool names: Edit→E, Write→W, Bash→B
+                        let short_name = match *name {
+                            "Edit" => "E",
+                            "Write" => "W",
+                            "Bash" => "B",
+                            _ => name,
+                        };
+                        output.push_str(short_name);
                         let summary = tool_summary(name, *input);
                         if !summary.is_empty() {
                             output.push('(');
@@ -268,10 +293,8 @@ pub fn format_context_with_options(messages: &[&TranscriptEntry], options: &Form
                 }
 
                 if let Some(text) = entry.assistant_text() {
-                    output.push_str("ASSISTANT: ");
+                    output.push_str("A: ");
                     output.push_str(&text);
-                    output.push_str("\n\n");
-                } else if !tool_uses.is_empty() {
                     output.push('\n');
                 }
             }

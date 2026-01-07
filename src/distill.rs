@@ -199,7 +199,7 @@ async fn call_extraction_llm(transcript: &str) -> Result<String, String> {
     // AIDEV-NOTE: Prompt based on engram-spec-v1.md extraction categories.
     // No structured format enforced - LLM narrates naturally.
     // The whole response becomes the node content.
-    let system_prompt = r#"You are extracting knowledge from an AI coding session transcript for a knowledge graph.
+    let system_prompt = r#"You are extracting knowledge from an AI <> Human session transcript for a knowledge graph.
 
 Your output will be stored and retrieved via semantic search in future sessions.
 

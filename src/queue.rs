@@ -164,6 +164,18 @@ impl Queue {
         Ok(done_count)
     }
 
+    /// Delete entire queue (all jobs, all statuses)
+    pub fn nuke(&self) -> Result<usize, String> {
+        let jobs = self.load_all()?;
+        let total = jobs.len();
+
+        // Truncate file to empty
+        File::create(&self.path)
+            .map_err(|e| format!("Failed to nuke queue: {}", e))?;
+
+        Ok(total)
+    }
+
     /// Load all jobs, deduplicating by source_id (latest wins)
     fn load_all(&self) -> Result<HashMap<String, Job>, String> {
         let mut jobs = HashMap::new();

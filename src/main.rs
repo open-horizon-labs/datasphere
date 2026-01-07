@@ -69,6 +69,9 @@ enum Commands {
         format: String,
     },
 
+    /// Delete everything (database + queue) and start fresh
+    Reset,
+
     /// Find nodes similar to a given node
     Related {
         /// Node ID (UUID) to find related nodes for
@@ -92,6 +95,8 @@ enum QueueAction {
     Pending,
     /// Clear completed jobs
     Clear,
+    /// Delete entire queue (all jobs, all statuses)
+    Nuke,
 }
 
 /// Get the default database path
@@ -137,6 +142,15 @@ fn dir_size(path: &PathBuf) -> u64 {
 /// Hamming distance threshold for considering a session "changed"
 /// AIDEV-NOTE: 10 bits out of 64 (~15%) means meaningful content change
 const SIMHASH_CHANGE_THRESHOLD: u32 = 10;
+
+/// Quick check if a transcript has any meaningful content (messages/summaries)
+/// Returns false for empty or content-free transcripts to avoid queueing them
+fn transcript_has_content(path: &std::path::Path) -> bool {
+    match read_transcript(path) {
+        Ok(entries) => entries.iter().any(|e| e.is_message() || e.is_summary()),
+        Err(_) => false,
+    }
+}
 
 /// Process a single session transcript
 /// Returns (nodes_created, skipped) tuple
@@ -504,6 +518,11 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
+                // Skip empty transcripts
+                if !transcript_has_content(&session.transcript_path) {
+                    continue;
+                }
+
                 let job = Job {
                     source_id: session.session_id.clone(),
                     source_type: "session".to_string(),
@@ -549,6 +568,11 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         // Drain all pending watcher events into queue
         while let Some(event) = watcher.try_recv() {
+            // Skip empty transcripts
+            if !transcript_has_content(&event.session.transcript_path) {
+                continue;
+            }
+
             let job = Job {
                 source_id: event.session.session_id.clone(),
                 source_type: "session".to_string(),
@@ -663,6 +687,11 @@ fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Erro
         QueueAction::Clear => {
             let cleared = queue.clear_done()?;
             println!("Cleared {} completed jobs.", cleared);
+        }
+
+        QueueAction::Nuke => {
+            let nuked = queue.nuke()?;
+            println!("Nuked {} jobs.", nuked);
         }
     }
 
@@ -899,6 +928,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Related { node_id, limit, format } => {
             run_related(&node_id, limit, &format).await?;
+        }
+
+        Commands::Reset => {
+            println!("engram reset");
+            println!("============");
+
+            // Delete database
+            let db_path = default_db_path();
+            if db_path.exists() {
+                std::fs::remove_dir_all(&db_path)
+                    .map_err(|e| format!("Failed to delete database: {}", e))?;
+                println!("Deleted database: {}", db_path.display());
+            } else {
+                println!("Database not found (already clean)");
+            }
+
+            // Nuke queue
+            let queue = Queue::open_default()?;
+            let nuked = queue.nuke()?;
+            if nuked > 0 {
+                println!("Nuked {} queued jobs", nuked);
+            } else {
+                println!("Queue was empty");
+            }
+
+            println!("\nReset complete. Run 'engram start' to begin fresh.");
         }
     }
 
