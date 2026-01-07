@@ -6,12 +6,12 @@ use engram::{
     Queue, SessionInfo, SourceType, Store,
 };
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "engram")]
-#[command(about = "Background daemon that distills and links knowledge from local sources")]
+#[command(about = "Background daemon that distills knowledge from local sources")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -222,6 +222,7 @@ async fn process_session(
 
     // Distill knowledge via LLM
     println!("  Distilling via LLM...");
+    let distill_start = Instant::now();
     let extraction = match extract_knowledge(&context).await {
         Ok(result) => result,
         Err(e) => {
@@ -229,10 +230,13 @@ async fn process_session(
             return Err(e.into());
         }
     };
+    let distill_elapsed = distill_start.elapsed();
 
     // Log chunking info if used
     if extraction.chunks_used > 1 {
-        println!("  Used {} chunks for distillation", extraction.chunks_used);
+        println!("  Distilled {} chunks in {:.1}s", extraction.chunks_used, distill_elapsed.as_secs_f32());
+    } else {
+        println!("  Distilled in {:.1}s", distill_elapsed.as_secs_f32());
     }
 
     if extraction.insights.is_empty() {
@@ -256,8 +260,9 @@ async fn process_session(
     let total_insights = extraction.insights.len();
     let mut node_ids = Vec::new();
     for (i, insight) in extraction.insights.into_iter().enumerate() {
-        println!("  Embedding insight {}/{}...", i + 1, total_insights);
+        let embed_start = Instant::now();
         let embedding = embed(&insight.content).await?;
+        println!("  Embedded {}/{} in {:.1}s", i + 1, total_insights, embed_start.elapsed().as_secs_f32());
 
         let node = insight.into_node(
             session.session_id.clone(),
@@ -266,7 +271,6 @@ async fn process_session(
         );
         let node_id = node.id.to_string();
 
-        println!("  Storing node {}...", &node_id[..8]);
         store.insert_node(&node).await?;
 
         node_ids.push(node_id);
@@ -350,8 +354,9 @@ async fn process_file(
     // Embed each chunk and create nodes
     let mut node_ids = Vec::new();
     for (i, chunk) in chunks.iter().enumerate() {
-        println!("  Embedding chunk {}/{}...", i + 1, chunks.len());
+        let embed_start = Instant::now();
         let embedding = embed(chunk).await?;
+        println!("  Embedded {}/{} in {:.1}s", i + 1, chunks.len(), embed_start.elapsed().as_secs_f32());
 
         let node = Node::new(
             chunk.clone(),

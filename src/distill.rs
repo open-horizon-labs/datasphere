@@ -19,6 +19,7 @@ use crate::llm;
 use futures::{stream, StreamExt};
 use semchunk_rs::Chunker;
 use std::sync::OnceLock;
+use std::time::Instant;
 use tiktoken_rs::{cl100k_base, CoreBPE};
 
 /// An extracted piece of knowledge ready to become a Node
@@ -136,6 +137,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, Str
     );
 
     // Distill chunks in parallel with bounded concurrency
+    let chunk_start = Instant::now();
     let chunk_results: Vec<(usize, Result<String, String>)> = stream::iter(chunks.into_iter().enumerate())
         .map(|(i, chunk)| async move {
             let result = call_extraction_llm(&chunk).await;
@@ -144,6 +146,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, Str
         .buffer_unordered(PARALLEL_DISTILLATIONS)
         .collect()
         .await;
+    eprintln!("    Chunk distillation completed in {:.1}s", chunk_start.elapsed().as_secs_f32());
 
     // Collect successful distillations (preserving order for consistency)
     let mut indexed_distillations: Vec<(usize, String)> = Vec::new();

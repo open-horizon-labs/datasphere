@@ -1,24 +1,17 @@
 # Engram
 
-Background daemon that distills and links knowledge from Claude Code sessions into a queryable knowledge graph.
+Background daemon that distills knowledge from Claude Code sessions into a queryable knowledge graph.
 
 ## What It Does
 
-Engram watches your Claude Code sessions, extracts insights via LLM distillation, embeds them for semantic search, and links related concepts together. Think of it as long-term memory for your AI coding sessions.
+Engram watches your Claude Code sessions, extracts insights via LLM distillation, and embeds them for semantic search. Think of it as long-term memory for your AI coding sessions.
 
 ```
 ┌─────────────────┐     ┌──────────┐     ┌─────────┐     ┌─────────┐
 │ Session JSONL   │────▶│ Distill  │────▶│  Embed  │────▶│ LanceDB │
-│ (~/.claude/     │     │ (Claude) │     │ (OpenAI)│     │         │
+│ (~/.claude/     │     │  (LLM)   │     │         │     │ (nodes) │
 │   projects/)    │     └──────────┘     └─────────┘     └─────────┘
-└─────────────────┘                            │              │
-                                               │   ┌──────────┘
-                                               ▼   ▼
-                                         ┌───────────┐
-                                         │   Link    │
-                                         │(similarity│
-                                         │  > 0.6)   │
-                                         └───────────┘
+└─────────────────┘
 ```
 
 ## Installation
@@ -81,18 +74,15 @@ This exposes `engram_query` tool that Claude can use to search your knowledge gr
 The daemon watches `~/.claude/projects/` for changes to session transcript files (`.jsonl`). Events are queued and processed one at a time with rate limiting.
 
 ### 2. Distillation
-Each session is chunked and sent to Claude for knowledge extraction. The LLM identifies:
+Each session is chunked and sent to an LLM for knowledge extraction. The LLM identifies:
 - Key insights and learnings
 - Patterns and approaches
 - Decisions and their rationale
 
 ### 3. Embedding
-Extracted insights are embedded using OpenAI's `text-embedding-3-small` (1536 dimensions) for semantic search.
+Extracted insights are embedded (1536 dimensions) for semantic search.
 
-### 4. Linking
-Nodes are linked to similar existing nodes when cosine similarity > 0.6. This creates a graph where related concepts cluster together.
-
-### 5. Change Detection
+### 4. Change Detection
 SimHash is used to detect meaningful changes. Sessions are only re-processed when content changes significantly (Hamming distance > 10 bits).
 
 ## Storage
@@ -101,7 +91,6 @@ SimHash is used to detect meaningful changes. Sessions are only re-processed whe
 ~/.engram/
 ├── db/                    # LanceDB database
 │   ├── nodes.lance/       # Knowledge nodes with embeddings
-│   ├── edges.lance/       # Similarity links between nodes
 │   └── processed.lance/   # Processing records (deduplication)
 └── queue.jsonl            # Persistent job queue
 ```
@@ -116,8 +105,6 @@ SimHash is used to detect meaningful changes. Sessions are only re-processed whe
 ## Configuration
 
 Currently configuration is via code constants:
-- Similarity threshold: 0.6
-- Max similar search: 20 nodes
 - Job processing delay: 500ms
 - SimHash change threshold: 10 bits
 

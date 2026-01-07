@@ -34,7 +34,7 @@ const server = new Server(
   }
 );
 
-// Define the single tool
+// Define tools
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -55,6 +55,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ['query']
       }
+    },
+    {
+      name: 'engram_related',
+      description: 'Find nodes similar to a specific node in the knowledge graph',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          node_id: {
+            type: 'string',
+            description: 'UUID of the node to find related nodes for'
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum number of results (default: 5)',
+            default: 5
+          }
+        },
+        required: ['node_id']
+      }
     }
   ]
 }));
@@ -63,55 +82,91 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  if (name !== 'engram_query') {
-    return {
-      content: [{ type: 'text', text: `Unknown tool: ${name}` }],
-      isError: true
-    };
-  }
+  if (name === 'engram_query') {
+    const { query, limit = 5 } = args;
 
-  const { query, limit = 5 } = args;
+    try {
+      const result = execSync(
+        `engram query --format json --limit ${limit} ${JSON.stringify(query)}`,
+        { encoding: 'utf-8', timeout: 30000 }
+      );
 
-  try {
-    // Shell out to engram query command
-    const result = execSync(
-      `engram query --format json --limit ${limit} ${JSON.stringify(query)}`,
-      { encoding: 'utf-8', timeout: 30000 }
-    );
+      const nodes = JSON.parse(result);
 
-    const nodes = JSON.parse(result);
+      if (nodes.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: 'No relevant results found in the knowledge graph.'
+          }]
+        };
+      }
 
-    if (nodes.length === 0) {
+      const formatted = nodes.map((node, i) =>
+        `## Result ${i + 1} (similarity: ${node.similarity.toFixed(2)})\n` +
+        `Source: ${node.source}\n` +
+        `Time: ${node.timestamp}\n\n` +
+        `${node.content}`
+      ).join('\n\n---\n\n');
+
       return {
-        content: [{
-          type: 'text',
-          text: 'No relevant results found in the knowledge graph.'
-        }]
+        content: [{ type: 'text', text: formatted }]
+      };
+
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        content: [{ type: 'text', text: `Error querying engram: ${message}` }],
+        isError: true
       };
     }
-
-    // Format results for Claude
-    const formatted = nodes.map((node, i) =>
-      `## Result ${i + 1} (similarity: ${node.similarity.toFixed(2)})\n` +
-      `Source: ${node.source}\n` +
-      `Time: ${node.timestamp}\n\n` +
-      `${node.content}`
-    ).join('\n\n---\n\n');
-
-    return {
-      content: [{
-        type: 'text',
-        text: formatted
-      }]
-    };
-
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return {
-      content: [{ type: 'text', text: `Error querying engram: ${message}` }],
-      isError: true
-    };
   }
+
+  if (name === 'engram_related') {
+    const { node_id, limit = 5 } = args;
+
+    try {
+      const result = execSync(
+        `engram related --format json --limit ${limit} ${node_id}`,
+        { encoding: 'utf-8', timeout: 30000 }
+      );
+
+      const nodes = JSON.parse(result);
+
+      if (nodes.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: 'No related nodes found.'
+          }]
+        };
+      }
+
+      const formatted = nodes.map((node, i) =>
+        `## Related ${i + 1} (similarity: ${node.similarity.toFixed(2)})\n` +
+        `ID: ${node.id}\n` +
+        `Source: ${node.source}\n` +
+        `Time: ${node.timestamp}\n\n` +
+        `${node.content}`
+      ).join('\n\n---\n\n');
+
+      return {
+        content: [{ type: 'text', text: formatted }]
+      };
+
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        content: [{ type: 'text', text: `Error finding related nodes: ${message}` }],
+        isError: true
+      };
+    }
+  }
+
+  return {
+    content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+    isError: true
+  };
 });
 
 // Start server
