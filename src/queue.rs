@@ -61,17 +61,19 @@ impl Queue {
     }
 
     /// Add a job to the queue (deduplicates by source_id)
-    pub fn add(&self, job: Job) -> Result<(), String> {
+    /// Returns Ok(true) if job was added, Ok(false) if skipped (already pending/processing)
+    pub fn add(&self, job: Job) -> Result<bool, String> {
         // Check if already pending/processing
         let jobs = self.load_all()?;
         if let Some(existing) = jobs.get(&job.source_id) {
             if existing.status == JobStatus::Pending || existing.status == JobStatus::Processing {
                 // Already queued, skip
-                return Ok(());
+                return Ok(false);
             }
         }
 
-        self.append(&job)
+        self.append(&job)?;
+        Ok(true)
     }
 
     /// Get oldest pending job and mark it as processing
@@ -280,8 +282,11 @@ mod tests {
             error: None,
         };
 
-        queue.add(job.clone()).unwrap();
-        queue.add(job.clone()).unwrap(); // Duplicate, should be ignored
+        let added = queue.add(job.clone()).unwrap();
+        assert!(added); // First add should succeed
+
+        let added = queue.add(job.clone()).unwrap();
+        assert!(!added); // Duplicate should be skipped
 
         let pending = queue.list_pending().unwrap();
         assert_eq!(pending.len(), 1);

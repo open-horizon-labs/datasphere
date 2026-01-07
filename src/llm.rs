@@ -3,8 +3,20 @@
 //! AIDEV-NOTE: Adapted from wm/src/llm.rs. Engram uses same pattern:
 //! call Claude CLI with a system prompt, parse response using text markers.
 
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use tokio::process::Command;
+
+/// Cached path to claude CLI binary (resolved once at first use)
+static CLAUDE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Get the path to the claude CLI, resolving it once via PATH lookup
+fn get_claude_path() -> &'static PathBuf {
+    CLAUDE_PATH.get_or_init(|| {
+        which::which("claude").unwrap_or_else(|_| PathBuf::from("claude"))
+    })
+}
 
 /// Result of calling the LLM with a marker-based response format
 #[derive(Debug)]
@@ -21,7 +33,7 @@ pub struct MarkerResponse {
 /// Returns the raw result string from the Claude CLI JSON response.
 /// Sets WM_DISABLED and SUPEREGO_DISABLED to prevent recursion.
 pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, String> {
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(get_claude_path());
     cmd.arg("-p")
         .arg("--output-format")
         .arg("json")

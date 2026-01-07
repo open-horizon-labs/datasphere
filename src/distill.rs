@@ -234,7 +234,9 @@ Write a concise summary capturing the key knowledge. Use whatever format (prose,
 
 Skip routine actions (ran tests, fixed typo). Focus on knowledge valuable for future sessions.
 
-If the session has no substantive knowledge, just say so briefly."#;
+If the session has no substantive knowledge, just say so briefly.
+
+IMPORTANT: Keep your response under 2000 words. Be concise and focus."#;
 
     let message = format!("TRANSCRIPT:\n{}", transcript);
     llm::call_claude(system_prompt, &message).await

@@ -90,18 +90,26 @@ engram queue clear       # Remove completed jobs
 engram stats             # Database statistics
 engram show              # Display nodes
 engram add <file>        # Add file (no LLM, direct embed)
+engram related <id>      # Find nodes similar to a node
 ```
 
 ## MCP Server
 
-`mcp/` contains Node.js MCP server that shells out to `engram query`:
+`mcp/` contains Node.js MCP server that shells out to `engram` CLI:
 
 ```bash
 cd mcp && npm install
 claude mcp add engram -s user -- node /path/to/mcp/index.js
 ```
 
-Exposes single tool: `engram_query(query, limit?)`.
+No build step required — pure JavaScript (ES modules).
+
+**Tools exposed:**
+
+| Tool | Description |
+|------|-------------|
+| `engram_query(query, limit?)` | Search knowledge graph by text |
+| `engram_related(node_id, limit?)` | Find nodes similar to a given node |
 
 ## Design Principles
 

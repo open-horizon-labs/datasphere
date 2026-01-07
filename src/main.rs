@@ -559,16 +559,18 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
                 error: None,
             };
 
-            if let Err(e) = queue.add(job) {
-                eprintln!("Failed to queue job: {}", e);
-            } else {
-                _queued_count += 1;
-                println!(
-                    "[QUEUE] {} ({}) from {}",
-                    &event.session.session_id[..8.min(event.session.session_id.len())],
-                    if event.is_new { "new" } else { "modified" },
-                    &event.project_id[..20.min(event.project_id.len())]
-                );
+            match queue.add(job) {
+                Ok(true) => {
+                    _queued_count += 1;
+                    println!(
+                        "[QUEUE] {} ({}) from {}",
+                        &event.session.session_id[..8.min(event.session.session_id.len())],
+                        if event.is_new { "new" } else { "modified" },
+                        &event.project_id
+                    );
+                }
+                Ok(false) => {} // Duplicate, already queued
+                Err(e) => eprintln!("Failed to queue job: {}", e),
             }
         }
 
@@ -577,7 +579,7 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "[PROCESS] {} from {}",
                 &job.source_id[..8.min(job.source_id.len())],
-                &job.project_id[..20.min(job.project_id.len())]
+                &job.project_id
             );
 
             // Build SessionInfo from job
@@ -652,7 +654,7 @@ fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Erro
                     println!(
                         "  {} ({})",
                         &job.source_id[..8.min(job.source_id.len())],
-                        &job.project_id[..30.min(job.project_id.len())]
+                        &job.project_id
                     );
                 }
             }
