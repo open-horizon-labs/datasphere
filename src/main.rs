@@ -153,9 +153,22 @@ async fn process_session(
 
     // Distill knowledge via LLM
     println!("  Distilling via LLM...");
-    let insight = match extract_knowledge(&context) {
-        Ok(Some(insight)) => insight,
-        Ok(None) => {
+    let extraction = match extract_knowledge(&context) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("  LLM extraction failed: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    // Log chunking info if used
+    if extraction.chunks_used > 1 {
+        println!("  Used {} chunks for distillation", extraction.chunks_used);
+    }
+
+    let insight = match extraction.insight {
+        Some(insight) => insight,
+        None => {
             println!("  No substantive knowledge found");
             // Still record as processed
             let record = Processed {
@@ -167,10 +180,6 @@ async fn process_session(
             };
             store.insert_processed(&record).await?;
             return Ok((0, false));
-        }
-        Err(e) => {
-            eprintln!("  LLM extraction failed: {}", e);
-            return Err(e.into());
         }
     };
 

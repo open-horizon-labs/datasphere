@@ -8,7 +8,7 @@ pub mod transcript;
 pub mod watch;
 
 pub use core::{Edge, Node, SourceType, EMBEDDING_DIM};
-pub use distill::{extract_knowledge, ExtractedInsight};
+pub use distill::{extract_knowledge, ExtractedInsight, ExtractionResult};
 pub use embed::{embed, EmbedError};
 pub use session::{discover_sessions, SessionInfo};
 pub use store::{Processed, Store};
