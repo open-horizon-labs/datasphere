@@ -23,17 +23,6 @@ pub fn nodes_schema() -> Arc<Schema> {
     ]))
 }
 
-pub fn edges_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("source_node", DataType::Utf8, false),
-        Field::new("target_node", DataType::Utf8, false),
-        Field::new("weight", DataType::Float32, false),
-        Field::new("created_at", DataType::Utf8, false),
-        Field::new("metadata", DataType::Utf8, true),
-    ]))
-}
-
 /// Schema for tracking processed sources (sessions, files, etc.)
 /// AIDEV-NOTE: source_id is the key (session UUID or canonical file path).
 /// source_type distinguishes sessions from files. node_ids is JSON array.

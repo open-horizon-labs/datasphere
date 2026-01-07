@@ -8,8 +8,8 @@ use lancedb::{connect, Connection, Table, query::{QueryBase, ExecutableQuery}, D
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::core::{Edge, Node, SourceType, EMBEDDING_DIM};
-use super::schema::{edges_schema, nodes_schema, processed_schema};
+use crate::core::{Node, SourceType, EMBEDDING_DIM};
+use super::schema::{nodes_schema, processed_schema};
 
 /// Record of a processed source (session or file)
 /// AIDEV-NOTE: source_id is the key (session UUID or canonical file path).
@@ -28,7 +28,6 @@ pub struct Store {
     #[allow(dead_code)]
     db: Connection,
     nodes: Table,
-    edges: Table,
     processed: Table,
 }
 
@@ -46,16 +45,6 @@ impl Store {
             }
         };
 
-        // Open or create edges table
-        let edges = match db.open_table("edges").execute().await {
-            Ok(t) => t,
-            Err(_) => {
-                db.create_empty_table("edges", edges_schema())
-                    .execute()
-                    .await?
-            }
-        };
-
         // Open or create processed table
         let processed = match db.open_table("processed").execute().await {
             Ok(t) => t,
@@ -66,7 +55,7 @@ impl Store {
             }
         };
 
-        Ok(Self { db, nodes, edges, processed })
+        Ok(Self { db, nodes, processed })
     }
 
     pub async fn insert_node(&self, node: &Node) -> Result<(), lancedb::Error> {
@@ -74,14 +63,6 @@ impl Store {
         let schema = nodes_schema();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         self.nodes.add(Box::new(batches)).execute().await?;
-        Ok(())
-    }
-
-    pub async fn insert_edge(&self, edge: &Edge) -> Result<(), lancedb::Error> {
-        let batch = edge_to_batch(edge)?;
-        let schema = edges_schema();
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        self.edges.add(Box::new(batches)).execute().await?;
         Ok(())
     }
 
@@ -134,27 +115,6 @@ impl Store {
         Ok(nodes_with_scores)
     }
 
-    pub async fn get_edges_for(&self, node_id: Uuid) -> Result<Vec<Edge>, lancedb::Error> {
-        let id_str = node_id.to_string();
-        let filter = format!(
-            "source_node = '{}' OR target_node = '{}'",
-            id_str, id_str
-        );
-
-        let mut results = self
-            .edges
-            .query()
-            .only_if(filter)
-            .execute()
-            .await?;
-
-        let mut edges = Vec::new();
-        while let Some(batch) = results.try_next().await? {
-            edges.extend(batch_to_edges(&batch)?);
-        }
-        Ok(edges)
-    }
-
     /// Get processed record by source_id
     pub async fn get_processed(&self, source_id: &str) -> Result<Option<Processed>, lancedb::Error> {
         let filter = format!("source_id = '{}'", source_id);
@@ -200,17 +160,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete all edges connected to a node (for cleanup on re-processing)
-    pub async fn delete_edges_for_node(&self, node_id: Uuid) -> Result<(), lancedb::Error> {
-        let id_str = node_id.to_string();
-        let filter = format!(
-            "source_node = '{}' OR target_node = '{}'",
-            id_str, id_str
-        );
-        self.edges.delete(&filter).await?;
-        Ok(())
-    }
-
     /// Get a node by ID
     pub async fn get_node(&self, id: Uuid) -> Result<Option<Node>, lancedb::Error> {
         let filter = format!("id = '{}'", id);
@@ -234,31 +183,6 @@ impl Store {
     /// Count total nodes in the store
     pub async fn count_nodes(&self) -> Result<usize, lancedb::Error> {
         self.nodes.count_rows(None).await
-    }
-
-    /// Get an edge by ID
-    pub async fn get_edge(&self, id: Uuid) -> Result<Option<Edge>, lancedb::Error> {
-        let filter = format!("id = '{}'", id);
-
-        let mut results = self
-            .edges
-            .query()
-            .only_if(filter)
-            .limit(1)
-            .execute()
-            .await?;
-
-        if let Some(batch) = results.try_next().await? {
-            let edges = batch_to_edges(&batch)?;
-            Ok(edges.into_iter().next())
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Count total edges in the store
-    pub async fn count_edges(&self) -> Result<usize, lancedb::Error> {
-        self.edges.count_rows(None).await
     }
 
     /// Count total processed transcripts
@@ -321,33 +245,6 @@ fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {
             Arc::new(timestamps),
             Arc::new(embeddings),
             Arc::new(confidences),
-            Arc::new(metadata),
-        ],
-    )
-    .map_err(|e| lancedb::Error::Arrow { source: e })?;
-
-    Ok(batch)
-}
-
-fn edge_to_batch(edge: &Edge) -> Result<RecordBatch, lancedb::Error> {
-    let ids = StringArray::from(vec![edge.id.to_string()]);
-    let source_nodes = StringArray::from(vec![edge.source_node.to_string()]);
-    let target_nodes = StringArray::from(vec![edge.target_node.to_string()]);
-    let weights = Float32Array::from(vec![edge.weight]);
-    let created_ats = StringArray::from(vec![edge.created_at.to_rfc3339()]);
-    let metadata = StringArray::from(vec![edge
-        .metadata
-        .as_ref()
-        .map(|m| m.to_string())]);
-
-    let batch = RecordBatch::try_new(
-        edges_schema(),
-        vec![
-            Arc::new(ids),
-            Arc::new(source_nodes),
-            Arc::new(target_nodes),
-            Arc::new(weights),
-            Arc::new(created_ats),
             Arc::new(metadata),
         ],
     )
@@ -487,99 +384,6 @@ fn extract_distances(batch: &RecordBatch) -> Result<Vec<f32>, lancedb::Error> {
         })?;
 
     Ok(distances.values().to_vec())
-}
-
-fn batch_to_edges(batch: &RecordBatch) -> Result<Vec<Edge>, lancedb::Error> {
-    let ids = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "id column not found".to_string(),
-        })?;
-
-    let source_nodes = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "source_node column not found".to_string(),
-        })?;
-
-    let target_nodes = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "target_node column not found".to_string(),
-        })?;
-
-    let weights = batch
-        .column(3)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "weight column not found".to_string(),
-        })?;
-
-    let created_ats = batch
-        .column(4)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "created_at column not found".to_string(),
-        })?;
-
-    let metadata_col = batch
-        .column(5)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "metadata column not found".to_string(),
-        })?;
-
-    let mut edges = Vec::with_capacity(batch.num_rows());
-    for i in 0..batch.num_rows() {
-        let metadata = if metadata_col.is_null(i) {
-            None
-        } else {
-            metadata_col
-                .value(i)
-                .parse::<serde_json::Value>()
-                .ok()
-        };
-
-        let edge = Edge {
-            id: ids
-                .value(i)
-                .parse()
-                .map_err(|_| lancedb::Error::InvalidInput {
-                    message: "invalid uuid".to_string(),
-                })?,
-            source_node: source_nodes
-                .value(i)
-                .parse()
-                .map_err(|_| lancedb::Error::InvalidInput {
-                    message: "invalid source_node uuid".to_string(),
-                })?,
-            target_node: target_nodes
-                .value(i)
-                .parse()
-                .map_err(|_| lancedb::Error::InvalidInput {
-                    message: "invalid target_node uuid".to_string(),
-                })?,
-            weight: weights.value(i),
-            created_at: chrono::DateTime::parse_from_rfc3339(created_ats.value(i))
-                .map_err(|_| lancedb::Error::InvalidInput {
-                    message: "invalid created_at timestamp".to_string(),
-                })?
-                .with_timezone(&chrono::Utc),
-            metadata,
-        };
-        edges.push(edge);
-    }
-
-    Ok(edges)
 }
 
 fn processed_to_batch(record: &Processed) -> Result<RecordBatch, lancedb::Error> {

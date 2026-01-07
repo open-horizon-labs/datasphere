@@ -58,8 +58,8 @@ pub struct AllProjectsWatcher {
 impl AllProjectsWatcher {
     /// Create a new watcher for all Claude projects.
     ///
-    /// Does NOT emit initial events for existing sessions - call `scan_existing()` separately
-    /// to queue those.
+    /// Does NOT emit initial events for existing sessions - the caller should scan
+    /// existing sessions separately (e.g., using `list_all_projects()` + `discover_sessions_in_dir()`).
     pub fn new() -> Result<Self, AllProjectsWatcherError> {
         let projects_dir =
             claude_projects_dir().ok_or(AllProjectsWatcherError::NoProjectsDir)?;
