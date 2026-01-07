@@ -1,10 +1,11 @@
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use engram::{
-    chunk_text, discover_sessions, embed, extract_knowledge, read_transcript, Edge, Node, Processed,
-    SessionEvent, SessionInfo, SessionWatcher, SourceType, Store,
+    chunk_text, discover_sessions, embed, extract_knowledge, read_transcript, AllProjectsWatcher,
+    Edge, Job, JobStatus, Node, Processed, Queue, SessionInfo, SourceType, Store,
 };
 use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -38,15 +39,13 @@ enum Commands {
         project: Option<PathBuf>,
     },
 
-    /// Start the daemon (continuous watching)
-    Start {
-        /// Maximum number of transcripts to process on startup
-        #[arg(short, long)]
-        limit: Option<usize>,
+    /// Start the daemon (watches all projects)
+    Start,
 
-        /// Project path to watch (defaults to current directory)
-        #[arg(short, long)]
-        project: Option<PathBuf>,
+    /// Show or manage the job queue
+    Queue {
+        #[command(subcommand)]
+        action: Option<QueueAction>,
     },
 
     /// Add a text file to the knowledge graph (no LLM distillation)
@@ -54,6 +53,16 @@ enum Commands {
         /// Path to the file to add
         file: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum QueueAction {
+    /// Show queue counts (default)
+    Status,
+    /// List pending jobs
+    Pending,
+    /// Clear completed jobs
+    Clear,
 }
 
 /// Get the default database path
@@ -486,87 +495,164 @@ async fn run_scan(
     Ok(())
 }
 
-/// Run start command - daemon mode
-async fn run_start(
-    project: Option<PathBuf>,
-    limit: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let project_path = project.unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+/// Delay between processing jobs (rate limiting)
+const JOB_DELAY_MS: u64 = 500;
 
+/// Run start command - daemon mode watching all projects
+async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
     println!("engram start");
     println!("============");
-    println!("Project: {}", project_path.display());
 
     // Open store
     let db_path = default_db_path();
     println!("Database: {}", db_path.display());
     let store = Store::open(db_path.to_str().unwrap()).await?;
 
-    // Create watcher - this emits Created events for all existing sessions
-    println!("\nStarting session watcher...");
-    let watcher = match SessionWatcher::new(&project_path) {
+    // Open queue
+    let queue = Queue::open_default().map_err(|e| format!("Failed to open queue: {}", e))?;
+
+    // Resume any pending/processing jobs from previous run
+    let (pending, processing, _, _) = queue.counts().unwrap_or((0, 0, 0, 0));
+    if pending > 0 || processing > 0 {
+        println!("Resuming {} pending, {} processing jobs from previous run", pending, processing);
+    }
+
+    // Create all-projects watcher
+    println!("\nStarting all-projects watcher...");
+    let watcher = match AllProjectsWatcher::new() {
         Ok(w) => w,
         Err(e) => {
             eprintln!("Failed to create watcher: {}", e);
             return Ok(());
         }
     };
-    println!("Watching: {}", watcher.project_dir().display());
+    println!("Watching: {}", watcher.projects_dir().display());
 
-    // Process events
-    let mut processed_count = 0;
-    let mut total_nodes = 0;
+    // Stats (prefixed with _ since loop is infinite, never printed)
+    let mut _queued_count = 0;
+    let mut _processed_count = 0;
+    let mut _total_nodes = 0;
 
-    println!("\nProcessing sessions (Ctrl+C to stop)...\n");
+    println!("\nDaemon running (Ctrl+C to stop)...\n");
 
-    for event in watcher.iter() {
-        let (session, event_type) = match event {
-            SessionEvent::Created(s) => (s, "new"),
-            SessionEvent::Modified(s) => (s, "modified"),
-        };
+    // Main loop: poll for watcher events, process queue
+    loop {
+        // Drain all pending watcher events into queue
+        while let Some(event) = watcher.try_recv() {
+            let job = Job {
+                source_id: event.session.session_id.clone(),
+                source_type: "session".to_string(),
+                project_id: event.project_id.clone(),
+                transcript_path: event.session.transcript_path.to_string_lossy().to_string(),
+                queued_at: Utc::now(),
+                status: JobStatus::Pending,
+                error: None,
+            };
 
-        // Apply limit for initial scan (Created events come first)
-        if event_type == "new" {
-            if let Some(max) = limit {
-                if processed_count >= max {
-                    println!(
-                        "Reached limit of {} sessions, skipping remaining initial sessions",
-                        max
-                    );
-                    // Drain remaining Created events without processing
-                    while let Some(SessionEvent::Created(_)) = watcher.try_recv() {}
-                    println!("Now watching for new changes...\n");
-                    continue;
-                }
+            if let Err(e) = queue.add(job) {
+                eprintln!("Failed to queue job: {}", e);
+            } else {
+                _queued_count += 1;
+                println!(
+                    "[QUEUE] {} ({}) from {}",
+                    &event.session.session_id[..8.min(event.session.session_id.len())],
+                    if event.is_new { "new" } else { "modified" },
+                    &event.project_id[..20.min(event.project_id.len())]
+                );
             }
         }
 
-        println!(
-            "[{}] Session {} ({}) - {}",
-            if event_type == "new" { "NEW" } else { "MOD" },
-            &session.session_id[..8.min(session.session_id.len())],
-            format_size(session.size_bytes),
-            event_type
-        );
+        // Process one job from queue
+        if let Ok(Some(job)) = queue.pop_pending() {
+            println!(
+                "[PROCESS] {} from {}",
+                &job.source_id[..8.min(job.source_id.len())],
+                &job.project_id[..20.min(job.project_id.len())]
+            );
 
-        match process_session(&store, &session).await {
-            Ok((nodes, was_skipped)) => {
-                if !was_skipped {
-                    processed_count += 1;
-                    total_nodes += nodes;
+            // Build SessionInfo from job
+            let session = SessionInfo {
+                session_id: job.source_id.clone(),
+                transcript_path: PathBuf::from(&job.transcript_path),
+                modified_at: job.queued_at, // Use queued time as proxy
+                size_bytes: std::fs::metadata(&job.transcript_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            };
+
+            match process_session(&store, &session).await {
+                Ok((nodes, was_skipped)) => {
+                    if let Err(e) = queue.mark_done(&job.source_id) {
+                        eprintln!("  Failed to mark done: {}", e);
+                    }
+                    if !was_skipped {
+                        _processed_count += 1;
+                        _total_nodes += nodes;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Error: {}", e);
+                    if let Err(e2) = queue.mark_failed(&job.source_id, &e.to_string()) {
+                        eprintln!("  Failed to mark failed: {}", e2);
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("  Error: {}", e);
-            }
+
+            // Rate limit
+            tokio::time::sleep(Duration::from_millis(JOB_DELAY_MS)).await;
+        } else {
+            // No pending jobs, sleep briefly before checking again
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    println!("\nDaemon stopped.");
-    println!("  Processed: {} sessions", processed_count);
-    println!("  Nodes:     {} created", total_nodes);
+    // Note: This is unreachable but kept for completeness
+    #[allow(unreachable_code)]
+    {
+        println!("\nDaemon stopped.");
+        println!("  Queued:    {} sessions", _queued_count);
+        println!("  Processed: {} sessions", _processed_count);
+        println!("  Nodes:     {} created", _total_nodes);
+        Ok(())
+    }
+}
+
+/// Run queue command - show/manage job queue
+fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Error>> {
+    let queue = Queue::open_default().map_err(|e| format!("Failed to open queue: {}", e))?;
+
+    match action.unwrap_or(QueueAction::Status) {
+        QueueAction::Status => {
+            let (pending, processing, done, failed) = queue.counts()?;
+            println!("engram queue");
+            println!("============");
+            println!("Pending:    {}", pending);
+            println!("Processing: {}", processing);
+            println!("Done:       {}", done);
+            println!("Failed:     {}", failed);
+        }
+
+        QueueAction::Pending => {
+            let jobs = queue.list_pending()?;
+            if jobs.is_empty() {
+                println!("No pending jobs.");
+            } else {
+                println!("Pending jobs ({}):", jobs.len());
+                for job in jobs {
+                    println!(
+                        "  {} ({})",
+                        &job.source_id[..8.min(job.source_id.len())],
+                        &job.project_id[..30.min(job.project_id.len())]
+                    );
+                }
+            }
+        }
+
+        QueueAction::Clear => {
+            let cleared = queue.clear_done()?;
+            println!("Cleared {} completed jobs.", cleared);
+        }
+    }
 
     Ok(())
 }
@@ -632,8 +718,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_scan(project, limit).await?;
         }
 
-        Commands::Start { limit, project } => {
-            run_start(project, limit).await?;
+        Commands::Start => {
+            run_start().await?;
+        }
+
+        Commands::Queue { action } => {
+            run_queue(action)?;
         }
 
         Commands::Add { file } => {
