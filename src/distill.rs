@@ -30,7 +30,7 @@ impl ExtractedInsight {
     /// # Arguments
     /// * `source` - Source identifier (e.g., session ID, file path)
     /// * `source_type` - Type of source (Session, File, etc.)
-    /// * `embedding` - Pre-computed embedding vector (3072 dims)
+    /// * `embedding` - Pre-computed embedding vector (1536 dims for text-embedding-3-small)
     pub fn into_node(self, source: String, source_type: SourceType, embedding: Vec<f32>) -> Node {
         Node::new(self.content, source, source_type, embedding, self.confidence)
     }

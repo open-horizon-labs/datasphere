@@ -215,6 +215,11 @@ impl Store {
     pub async fn count_edges(&self) -> Result<usize, lancedb::Error> {
         self.edges.count_rows(None).await
     }
+
+    /// Count total processed transcripts
+    pub async fn count_processed(&self) -> Result<usize, lancedb::Error> {
+        self.processed.count_rows(None).await
+    }
 }
 
 fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {

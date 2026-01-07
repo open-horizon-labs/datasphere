@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const EMBEDDING_DIM: usize = 3072;
+// AIDEV-NOTE: Using text-embedding-3-small (1536 dims, 8191 max tokens, $0.02/1M tokens)
+// If switching to text-embedding-3-large, change to 3072 dims
+pub const EMBEDDING_DIM: usize = 1536;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

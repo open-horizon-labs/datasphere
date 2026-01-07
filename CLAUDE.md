@@ -32,34 +32,36 @@ cargo test               # Run tests
 ```
 src/
 ├── main.rs           # CLI entry point
-├── lib.rs            # Core library
+├── lib.rs            # Core library exports
 ├── core/
 │   ├── mod.rs
-│   ├── node.rs       # Node types and schema
+│   ├── node.rs       # Node types (EMBEDDING_DIM = 1536)
 │   └── edge.rs       # Edge types
 ├── store/
 │   ├── mod.rs
-│   └── lance.rs      # LanceDB wrapper
-├── distill/
+│   ├── lance.rs      # LanceDB wrapper
+│   └── schema.rs     # Arrow schemas
+├── distill.rs        # LLM knowledge extraction
+├── embed.rs          # OpenAI embeddings (text-embedding-3-small)
+├── llm.rs            # Claude CLI wrapper
+├── session.rs        # Session discovery
+├── transcript/
 │   ├── mod.rs
-│   ├── llm.rs        # LLM extraction
-│   └── embed.rs      # Embedding generation
-├── link/
-│   ├── mod.rs
-│   ├── semantic.rs   # Cosine similarity linking
-│   └── explicit.rs   # Reference extraction
+│   ├── reader.rs     # JSONL parsing, context formatting
+│   └── types.rs      # Transcript entry types
 └── watch/
     ├── mod.rs
-    └── session.rs    # Claude session watcher
+    └── session.rs    # File watcher for sessions
 ```
 
 ## Storage
 
 ```
-~/.local/share/engram/
+~/.engram/
 └── db/               # LanceDB database
     ├── nodes.lance/
-    └── edges.lance/
+    ├── edges.lance/
+    └── processed.lance/
 ```
 
 ## Design Principles

@@ -33,11 +33,21 @@ arrow-schema = "56"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 futures = "0.3"
 
+# HTTP client for OpenAI API
+reqwest = { version = "0.13", features = ["json"] }
+
+# Tokenization for OpenAI models (cl100k_base encoding)
+tiktoken-rs = "0.9"
+
+# Semantic text chunking
+semchunk-rs = "0.1"
+
 # File watching
 notify = "8.2.0"
 
 # Paths
 dirs = "6"
+walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
