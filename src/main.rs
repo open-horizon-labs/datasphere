@@ -4,9 +4,8 @@ use engram::{
     discover_sessions, embed, extract_knowledge, read_transcript, Processed, SessionEvent,
     SessionInfo, SessionWatcher, SourceType, Store,
 };
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "engram")]
@@ -91,12 +90,9 @@ fn dir_size(path: &PathBuf) -> u64 {
         .sum()
 }
 
-/// Compute content hash for a transcript file
-fn compute_hash(content: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+/// Hamming distance threshold for considering a session "changed"
+/// AIDEV-NOTE: 10 bits out of 64 (~15%) means meaningful content change
+const SIMHASH_CHANGE_THRESHOLD: u32 = 10;
 
 /// Process a single session transcript
 /// Returns (nodes_created, skipped) tuple
@@ -105,16 +101,6 @@ async fn process_session(
     session: &SessionInfo,
 ) -> Result<(usize, bool), Box<dyn std::error::Error>> {
     println!("  Reading transcript...");
-
-    // Read transcript file content for hashing
-    let content = std::fs::read_to_string(&session.transcript_path)?;
-    let hash = compute_hash(&content);
-
-    // Check if already processed
-    if store.is_processed(&hash).await? {
-        println!("  Already processed (hash: {}...)", &hash[..8]);
-        return Ok((0, true));
-    }
 
     // Parse transcript
     let entries = read_transcript(&session.transcript_path)?;
@@ -158,6 +144,36 @@ async fn process_session(
 
     println!("  Context size: {} chars", context.len());
 
+    // Compute SimHash of context
+    let current_simhash = simhash::simhash(&context) as i64;
+
+    // Check if already processed
+    if let Some(existing) = store.get_processed(&session.session_id).await? {
+        let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
+
+        if hamming <= SIMHASH_CHANGE_THRESHOLD {
+            println!(
+                "  Unchanged (simhash distance: {} bits, threshold: {})",
+                hamming, SIMHASH_CHANGE_THRESHOLD
+            );
+            return Ok((0, true));
+        }
+
+        println!(
+            "  Session changed (simhash distance: {} bits), re-distilling...",
+            hamming
+        );
+
+        // Delete old node and processed record
+        if let Some(node_id) = &existing.node_id {
+            if let Ok(uuid) = node_id.parse::<Uuid>() {
+                store.delete_node(uuid).await?;
+                println!("  Deleted old node {}", &node_id[..8]);
+            }
+        }
+        store.delete_processed(&session.session_id).await?;
+    }
+
     // Distill knowledge via LLM
     println!("  Distilling via LLM...");
     let extraction = match extract_knowledge(&context) {
@@ -179,11 +195,11 @@ async fn process_session(
             println!("  No substantive knowledge found");
             // Still record as processed
             let record = Processed {
-                hash,
                 session_id: session.session_id.clone(),
+                simhash: current_simhash,
                 processed_at: Utc::now(),
                 node_count: 0,
-                file_size: session.size_bytes as i64,
+                node_id: None,
             };
             store.insert_processed(&record).await?;
             return Ok((0, false));
@@ -203,17 +219,18 @@ async fn process_session(
         SourceType::Session,
         embedding,
     );
+    let node_id = node.id.to_string();
 
-    println!("  Storing node {}...", node.id);
+    println!("  Storing node {}...", &node_id[..8]);
     store.insert_node(&node).await?;
 
     // Record as processed
     let record = Processed {
-        hash,
         session_id: session.session_id.clone(),
+        simhash: current_simhash,
         processed_at: Utc::now(),
         node_count: 1,
-        file_size: session.size_bytes as i64,
+        node_id: Some(node_id),
     };
     store.insert_processed(&record).await?;
 

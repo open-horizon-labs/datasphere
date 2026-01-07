@@ -35,12 +35,13 @@ pub fn edges_schema() -> Arc<Schema> {
 }
 
 /// Schema for tracking processed transcripts
+/// AIDEV-NOTE: session_id is the key. simhash detects meaningful content changes.
 pub fn processed_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("hash", DataType::Utf8, false),        // file content hash (primary key)
-        Field::new("session_id", DataType::Utf8, false),  // session UUID
+        Field::new("session_id", DataType::Utf8, false),   // session UUID (primary key)
+        Field::new("simhash", DataType::Int64, false),     // SimHash of formatted context
         Field::new("processed_at", DataType::Utf8, false), // ISO timestamp
-        Field::new("node_count", DataType::Int32, false), // nodes created
-        Field::new("file_size", DataType::Int64, false),  // original file size in bytes
+        Field::new("node_count", DataType::Int32, false),  // nodes created
+        Field::new("node_id", DataType::Utf8, true),       // UUID of created node (for updates)
     ]))
 }

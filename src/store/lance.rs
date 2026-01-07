@@ -12,13 +12,14 @@ use crate::core::{Edge, Node, SourceType, EMBEDDING_DIM};
 use super::schema::{edges_schema, nodes_schema, processed_schema};
 
 /// Record of a processed transcript
+/// AIDEV-NOTE: session_id is the key, simhash detects content changes
 #[derive(Debug, Clone)]
 pub struct Processed {
-    pub hash: String,
     pub session_id: String,
+    pub simhash: i64,
     pub processed_at: DateTime<Utc>,
     pub node_count: i32,
-    pub file_size: i64,
+    pub node_id: Option<String>, // UUID of created node (for updates)
 }
 
 pub struct Store {
@@ -122,24 +123,9 @@ impl Store {
         Ok(edges)
     }
 
-    /// Check if a transcript hash has been processed
-    pub async fn is_processed(&self, hash: &str) -> Result<bool, lancedb::Error> {
-        let filter = format!("hash = '{}'", hash);
-
-        let mut results = self
-            .processed
-            .query()
-            .only_if(filter)
-            .limit(1)
-            .execute()
-            .await?;
-
-        Ok(results.try_next().await?.is_some())
-    }
-
-    /// Get processed record by hash
-    pub async fn get_processed(&self, hash: &str) -> Result<Option<Processed>, lancedb::Error> {
-        let filter = format!("hash = '{}'", hash);
+    /// Get processed record by session_id
+    pub async fn get_processed(&self, session_id: &str) -> Result<Option<Processed>, lancedb::Error> {
+        let filter = format!("session_id = '{}'", session_id);
 
         let mut results = self
             .processed
@@ -163,6 +149,13 @@ impl Store {
         let schema = processed_schema();
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         self.processed.add(Box::new(batches)).execute().await?;
+        Ok(())
+    }
+
+    /// Delete processed record by session_id (for re-processing)
+    pub async fn delete_processed(&self, session_id: &str) -> Result<(), lancedb::Error> {
+        let filter = format!("session_id = '{}'", session_id);
+        self.processed.delete(&filter).await?;
         Ok(())
     }
 
@@ -235,6 +228,13 @@ impl Store {
             nodes.extend(batch_to_nodes(&batch)?);
         }
         Ok(nodes)
+    }
+
+    /// Delete a node by ID (for re-processing)
+    pub async fn delete_node(&self, id: Uuid) -> Result<(), lancedb::Error> {
+        let filter = format!("id = '{}'", id);
+        self.nodes.delete(&filter).await?;
+        Ok(())
     }
 }
 
@@ -510,20 +510,20 @@ fn batch_to_edges(batch: &RecordBatch) -> Result<Vec<Edge>, lancedb::Error> {
 }
 
 fn processed_to_batch(record: &Processed) -> Result<RecordBatch, lancedb::Error> {
-    let hashes = StringArray::from(vec![record.hash.as_str()]);
     let session_ids = StringArray::from(vec![record.session_id.as_str()]);
+    let simhashes = Int64Array::from(vec![record.simhash]);
     let processed_ats = StringArray::from(vec![record.processed_at.to_rfc3339()]);
     let node_counts = Int32Array::from(vec![record.node_count]);
-    let file_sizes = Int64Array::from(vec![record.file_size]);
+    let node_ids = StringArray::from(vec![record.node_id.as_deref()]);
 
     let batch = RecordBatch::try_new(
         processed_schema(),
         vec![
-            Arc::new(hashes),
             Arc::new(session_ids),
+            Arc::new(simhashes),
             Arc::new(processed_ats),
             Arc::new(node_counts),
-            Arc::new(file_sizes),
+            Arc::new(node_ids),
         ],
     )
     .map_err(|e| lancedb::Error::Arrow { source: e })?;
@@ -532,20 +532,20 @@ fn processed_to_batch(record: &Processed) -> Result<RecordBatch, lancedb::Error>
 }
 
 fn batch_to_processed(batch: &RecordBatch) -> Result<Vec<Processed>, lancedb::Error> {
-    let hashes = batch
+    let session_ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "hash column not found".to_string(),
+            message: "session_id column not found".to_string(),
         })?;
 
-    let session_ids = batch
+    let simhashes = batch
         .column(1)
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<Int64Array>()
         .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "session_id column not found".to_string(),
+            message: "simhash column not found".to_string(),
         })?;
 
     let processed_ats = batch
@@ -564,26 +564,30 @@ fn batch_to_processed(batch: &RecordBatch) -> Result<Vec<Processed>, lancedb::Er
             message: "node_count column not found".to_string(),
         })?;
 
-    let file_sizes = batch
+    let node_ids = batch
         .column(4)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<StringArray>()
         .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "file_size column not found".to_string(),
+            message: "node_id column not found".to_string(),
         })?;
 
     let mut records = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         let record = Processed {
-            hash: hashes.value(i).to_string(),
             session_id: session_ids.value(i).to_string(),
+            simhash: simhashes.value(i),
             processed_at: chrono::DateTime::parse_from_rfc3339(processed_ats.value(i))
                 .map_err(|_| lancedb::Error::InvalidInput {
                     message: "invalid processed_at timestamp".to_string(),
                 })?
                 .with_timezone(&chrono::Utc),
             node_count: node_counts.value(i),
-            file_size: file_sizes.value(i),
+            node_id: if node_ids.is_null(i) {
+                None
+            } else {
+                Some(node_ids.value(i).to_string())
+            },
         };
         records.push(record);
     }
