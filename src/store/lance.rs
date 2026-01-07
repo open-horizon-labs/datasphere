@@ -11,15 +11,17 @@ use uuid::Uuid;
 use crate::core::{Edge, Node, SourceType, EMBEDDING_DIM};
 use super::schema::{edges_schema, nodes_schema, processed_schema};
 
-/// Record of a processed transcript
-/// AIDEV-NOTE: session_id is the key, simhash detects content changes
+/// Record of a processed source (session or file)
+/// AIDEV-NOTE: source_id is the key (session UUID or canonical file path).
+/// source_type distinguishes sessions from files. node_ids tracks all created nodes.
 #[derive(Debug, Clone)]
 pub struct Processed {
-    pub session_id: String,
+    pub source_id: String,       // session UUID or canonical file path
+    pub source_type: String,     // "session" or "file"
     pub simhash: i64,
     pub processed_at: DateTime<Utc>,
     pub node_count: i32,
-    pub node_id: Option<String>, // UUID of created node (for updates)
+    pub node_ids: Vec<String>,   // UUIDs of created nodes (for updates/deletion)
 }
 
 pub struct Store {
@@ -123,9 +125,9 @@ impl Store {
         Ok(edges)
     }
 
-    /// Get processed record by session_id
-    pub async fn get_processed(&self, session_id: &str) -> Result<Option<Processed>, lancedb::Error> {
-        let filter = format!("session_id = '{}'", session_id);
+    /// Get processed record by source_id
+    pub async fn get_processed(&self, source_id: &str) -> Result<Option<Processed>, lancedb::Error> {
+        let filter = format!("source_id = '{}'", source_id);
 
         let mut results = self
             .processed
@@ -152,10 +154,19 @@ impl Store {
         Ok(())
     }
 
-    /// Delete processed record by session_id (for re-processing)
-    pub async fn delete_processed(&self, session_id: &str) -> Result<(), lancedb::Error> {
-        let filter = format!("session_id = '{}'", session_id);
+    /// Delete processed record by source_id (for re-processing)
+    pub async fn delete_processed(&self, source_id: &str) -> Result<(), lancedb::Error> {
+        let filter = format!("source_id = '{}'", source_id);
         self.processed.delete(&filter).await?;
+        Ok(())
+    }
+
+    /// Delete multiple nodes by ID (for re-processing files with multiple chunks)
+    pub async fn delete_nodes(&self, ids: &[Uuid]) -> Result<(), lancedb::Error> {
+        for id in ids {
+            let filter = format!("id = '{}'", id);
+            self.nodes.delete(&filter).await?;
+        }
         Ok(())
     }
 
@@ -244,6 +255,7 @@ fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {
     let sources = StringArray::from(vec![node.source.as_str()]);
     let source_types = StringArray::from(vec![match node.source_type {
         SourceType::Session => "session",
+        SourceType::File => "file",
     }]);
     let timestamps = StringArray::from(vec![node.timestamp.to_rfc3339()]);
 
@@ -399,6 +411,7 @@ fn batch_to_nodes(batch: &RecordBatch) -> Result<Vec<Node>, lancedb::Error> {
             source: sources.value(i).to_string(),
             source_type: match source_types.value(i) {
                 "session" => SourceType::Session,
+                "file" => SourceType::File,
                 _ => SourceType::Session,
             },
             timestamp: chrono::DateTime::parse_from_rfc3339(timestamps.value(i))
@@ -510,16 +523,20 @@ fn batch_to_edges(batch: &RecordBatch) -> Result<Vec<Edge>, lancedb::Error> {
 }
 
 fn processed_to_batch(record: &Processed) -> Result<RecordBatch, lancedb::Error> {
-    let session_ids = StringArray::from(vec![record.session_id.as_str()]);
+    let source_ids = StringArray::from(vec![record.source_id.as_str()]);
+    let source_types = StringArray::from(vec![record.source_type.as_str()]);
     let simhashes = Int64Array::from(vec![record.simhash]);
     let processed_ats = StringArray::from(vec![record.processed_at.to_rfc3339()]);
     let node_counts = Int32Array::from(vec![record.node_count]);
-    let node_ids = StringArray::from(vec![record.node_id.as_deref()]);
+    // Serialize node_ids as JSON array
+    let node_ids_json = serde_json::to_string(&record.node_ids).unwrap_or_else(|_| "[]".to_string());
+    let node_ids = StringArray::from(vec![Some(node_ids_json.as_str())]);
 
     let batch = RecordBatch::try_new(
         processed_schema(),
         vec![
-            Arc::new(session_ids),
+            Arc::new(source_ids),
+            Arc::new(source_types),
             Arc::new(simhashes),
             Arc::new(processed_ats),
             Arc::new(node_counts),
@@ -532,16 +549,24 @@ fn processed_to_batch(record: &Processed) -> Result<RecordBatch, lancedb::Error>
 }
 
 fn batch_to_processed(batch: &RecordBatch) -> Result<Vec<Processed>, lancedb::Error> {
-    let session_ids = batch
+    let source_ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "session_id column not found".to_string(),
+            message: "source_id column not found".to_string(),
+        })?;
+
+    let source_types = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| lancedb::Error::InvalidInput {
+            message: "source_type column not found".to_string(),
         })?;
 
     let simhashes = batch
-        .column(1)
+        .column(2)
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| lancedb::Error::InvalidInput {
@@ -549,7 +574,7 @@ fn batch_to_processed(batch: &RecordBatch) -> Result<Vec<Processed>, lancedb::Er
         })?;
 
     let processed_ats = batch
-        .column(2)
+        .column(3)
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| lancedb::Error::InvalidInput {
@@ -557,25 +582,33 @@ fn batch_to_processed(batch: &RecordBatch) -> Result<Vec<Processed>, lancedb::Er
         })?;
 
     let node_counts = batch
-        .column(3)
+        .column(4)
         .as_any()
         .downcast_ref::<Int32Array>()
         .ok_or_else(|| lancedb::Error::InvalidInput {
             message: "node_count column not found".to_string(),
         })?;
 
-    let node_ids = batch
-        .column(4)
+    let node_ids_col = batch
+        .column(5)
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| lancedb::Error::InvalidInput {
-            message: "node_id column not found".to_string(),
+            message: "node_ids column not found".to_string(),
         })?;
 
     let mut records = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
+        // Parse node_ids from JSON array
+        let node_ids: Vec<String> = if node_ids_col.is_null(i) {
+            Vec::new()
+        } else {
+            serde_json::from_str(node_ids_col.value(i)).unwrap_or_default()
+        };
+
         let record = Processed {
-            session_id: session_ids.value(i).to_string(),
+            source_id: source_ids.value(i).to_string(),
+            source_type: source_types.value(i).to_string(),
             simhash: simhashes.value(i),
             processed_at: chrono::DateTime::parse_from_rfc3339(processed_ats.value(i))
                 .map_err(|_| lancedb::Error::InvalidInput {
@@ -583,11 +616,7 @@ fn batch_to_processed(batch: &RecordBatch) -> Result<Vec<Processed>, lancedb::Er
                 })?
                 .with_timezone(&chrono::Utc),
             node_count: node_counts.value(i),
-            node_id: if node_ids.is_null(i) {
-                None
-            } else {
-                Some(node_ids.value(i).to_string())
-            },
+            node_ids,
         };
         records.push(record);
     }

@@ -10,7 +10,8 @@ pub const EMBEDDING_DIM: usize = 1536;
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
     Session,
-    // Future: File, Git
+    File,
+    // Future: Git
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

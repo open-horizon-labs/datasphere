@@ -125,7 +125,7 @@ fn count_tokens(text: &str) -> usize {
 ///
 /// Uses semchunk-rs for semantic chunking with tiktoken for accurate token counting.
 /// AIDEV-NOTE: Chunker can't be cached (not Sync), but BPE is cached so this is fast enough.
-fn chunk_text(text: &str) -> Vec<String> {
+pub fn chunk_text(text: &str) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
         return vec![];

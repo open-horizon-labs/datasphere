@@ -1,8 +1,8 @@
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use engram::{
-    discover_sessions, embed, extract_knowledge, read_transcript, Processed, SessionEvent,
-    SessionInfo, SessionWatcher, SourceType, Store,
+    chunk_text, discover_sessions, embed, extract_knowledge, read_transcript, Node, Processed,
+    SessionEvent, SessionInfo, SessionWatcher, SourceType, Store,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -47,6 +47,12 @@ enum Commands {
         /// Project path to watch (defaults to current directory)
         #[arg(short, long)]
         project: Option<PathBuf>,
+    },
+
+    /// Add a text file to the knowledge graph (no LLM distillation)
+    Add {
+        /// Path to the file to add
+        file: PathBuf,
     },
 }
 
@@ -164,12 +170,14 @@ async fn process_session(
             hamming
         );
 
-        // Delete old node and processed record
-        if let Some(node_id) = &existing.node_id {
-            if let Ok(uuid) = node_id.parse::<Uuid>() {
-                store.delete_node(uuid).await?;
-                println!("  Deleted old node {}", &node_id[..8]);
-            }
+        // Delete old nodes and processed record
+        let node_ids: Vec<Uuid> = existing.node_ids
+            .iter()
+            .filter_map(|id| id.parse::<Uuid>().ok())
+            .collect();
+        if !node_ids.is_empty() {
+            store.delete_nodes(&node_ids).await?;
+            println!("  Deleted {} old node(s)", node_ids.len());
         }
         store.delete_processed(&session.session_id).await?;
     }
@@ -195,11 +203,12 @@ async fn process_session(
             println!("  No substantive knowledge found");
             // Still record as processed
             let record = Processed {
-                session_id: session.session_id.clone(),
+                source_id: session.session_id.clone(),
+                source_type: "session".to_string(),
                 simhash: current_simhash,
                 processed_at: Utc::now(),
                 node_count: 0,
-                node_id: None,
+                node_ids: Vec::new(),
             };
             store.insert_processed(&record).await?;
             return Ok((0, false));
@@ -226,16 +235,110 @@ async fn process_session(
 
     // Record as processed
     let record = Processed {
-        session_id: session.session_id.clone(),
+        source_id: session.session_id.clone(),
+        source_type: "session".to_string(),
         simhash: current_simhash,
         processed_at: Utc::now(),
         node_count: 1,
-        node_id: Some(node_id),
+        node_ids: vec![node_id],
     };
     store.insert_processed(&record).await?;
 
     println!("  Done!");
     Ok((1, false))
+}
+
+/// Process a single text file (no LLM distillation, direct embedding)
+/// Returns number of nodes created
+async fn process_file(
+    store: &Store,
+    file_path: &PathBuf,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    // Canonicalize path to avoid duplicates
+    let canonical_path = file_path.canonicalize()
+        .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
+    let source_id = canonical_path.to_string_lossy().to_string();
+
+    println!("Processing file: {}", canonical_path.display());
+
+    // Read file content
+    let content = std::fs::read_to_string(&canonical_path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    if content.trim().is_empty() {
+        println!("  Empty file, skipping");
+        return Ok(0);
+    }
+
+    println!("  File size: {} chars", content.len());
+
+    // Compute SimHash
+    let current_simhash = simhash::simhash(&content) as i64;
+
+    // Check if already processed
+    if let Some(existing) = store.get_processed(&source_id).await? {
+        let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
+
+        if hamming <= SIMHASH_CHANGE_THRESHOLD {
+            println!(
+                "  Unchanged (simhash distance: {} bits, threshold: {})",
+                hamming, SIMHASH_CHANGE_THRESHOLD
+            );
+            return Ok(0);
+        }
+
+        println!(
+            "  File changed (simhash distance: {} bits), re-embedding...",
+            hamming
+        );
+
+        // Delete old nodes and processed record
+        let node_ids: Vec<Uuid> = existing.node_ids
+            .iter()
+            .filter_map(|id| id.parse::<Uuid>().ok())
+            .collect();
+        if !node_ids.is_empty() {
+            store.delete_nodes(&node_ids).await?;
+            println!("  Deleted {} old node(s)", node_ids.len());
+        }
+        store.delete_processed(&source_id).await?;
+    }
+
+    // Chunk content if needed
+    let chunks = chunk_text(&content);
+    println!("  Chunks: {}", chunks.len());
+
+    // Embed each chunk and create nodes
+    let mut node_ids = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("  Embedding chunk {}/{}...", i + 1, chunks.len());
+        let embedding = embed(chunk).await?;
+
+        let node = Node::new(
+            chunk.clone(),
+            source_id.clone(),
+            SourceType::File,
+            embedding,
+            1.0, // Full confidence for raw file content
+        );
+        let node_id = node.id.to_string();
+        store.insert_node(&node).await?;
+        node_ids.push(node_id);
+    }
+
+    // Record as processed
+    let record = Processed {
+        source_id: source_id.clone(),
+        source_type: "file".to_string(),
+        simhash: current_simhash,
+        processed_at: Utc::now(),
+        node_count: node_ids.len() as i32,
+        node_ids,
+    };
+    store.insert_processed(&record).await?;
+
+    println!("  Done! Created {} node(s)", record.node_count);
+    Ok(record.node_count as usize)
 }
 
 /// Run scan command - one-shot distillation
@@ -469,6 +572,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Start { limit, project } => {
             run_start(project, limit).await?;
+        }
+
+        Commands::Add { file } => {
+            if !file.exists() {
+                eprintln!("File not found: {}", file.display());
+                return Ok(());
+            }
+
+            let db_path = default_db_path();
+            let store = Store::open(db_path.to_str().unwrap()).await?;
+
+            println!("engram add");
+            println!("==========");
+
+            match process_file(&store, &file).await {
+                Ok(nodes) => {
+                    if nodes > 0 {
+                        println!("\nCreated {} node(s)", nodes);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                }
+            }
         }
     }
 

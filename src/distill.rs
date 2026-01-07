@@ -290,13 +290,13 @@ mod tests {
         assert_eq!(node.embedding.len(), EMBEDDING_DIM);
     }
 
-    #[test]
-    fn test_extract_knowledge_empty_transcript() {
-        let result = extract_knowledge("").unwrap();
+    #[tokio::test]
+    async fn test_extract_knowledge_empty_transcript() {
+        let result = extract_knowledge("").await.unwrap();
         assert!(result.insight.is_none());
         assert_eq!(result.chunks_used, 0);
 
-        let result = extract_knowledge("   ").unwrap();
+        let result = extract_knowledge("   ").await.unwrap();
         assert!(result.insight.is_none());
         assert_eq!(result.chunks_used, 0);
     }
