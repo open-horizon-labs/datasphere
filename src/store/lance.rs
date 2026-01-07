@@ -220,6 +220,22 @@ impl Store {
     pub async fn count_processed(&self) -> Result<usize, lancedb::Error> {
         self.processed.count_rows(None).await
     }
+
+    /// List recent nodes (by timestamp, newest first)
+    pub async fn list_nodes(&self, limit: usize) -> Result<Vec<Node>, lancedb::Error> {
+        let mut results = self
+            .nodes
+            .query()
+            .limit(limit)
+            .execute()
+            .await?;
+
+        let mut nodes = Vec::new();
+        while let Some(batch) = results.try_next().await? {
+            nodes.extend(batch_to_nodes(&batch)?);
+        }
+        Ok(nodes)
+    }
 }
 
 fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {

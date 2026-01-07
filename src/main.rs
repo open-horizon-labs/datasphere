@@ -21,6 +21,13 @@ enum Commands {
     /// Show database statistics
     Stats,
 
+    /// Show stored nodes
+    Show {
+        /// Maximum number of nodes to show
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
     /// Scan and distill transcripts (one-shot)
     Scan {
         /// Maximum number of transcripts to process (newest first)
@@ -411,6 +418,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Nodes:      {}", nodes);
             println!("Edges:      {}", edges);
             println!("Processed:  {} transcripts", processed);
+        }
+
+        Commands::Show { limit } => {
+            let db_path = default_db_path();
+
+            if !db_path.exists() {
+                println!("Database not found at: {}", db_path.display());
+                return Ok(());
+            }
+
+            let store = Store::open(db_path.to_str().unwrap()).await?;
+            let nodes = store.list_nodes(limit).await?;
+
+            if nodes.is_empty() {
+                println!("No nodes stored yet.");
+                return Ok(());
+            }
+
+            for (i, node) in nodes.iter().enumerate() {
+                println!("─── Node {} ───", i + 1);
+                println!("ID:      {}", node.id);
+                println!("Source:  {}", node.source);
+                println!("Time:    {}", node.timestamp.format("%Y-%m-%d %H:%M"));
+                println!("Content:\n{}", node.content);
+                println!();
+            }
         }
 
         Commands::Scan { limit, project } => {
