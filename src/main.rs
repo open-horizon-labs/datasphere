@@ -1,7 +1,7 @@
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use engram::{
-    chunk_text, discover_sessions, embed, extract_knowledge, read_transcript, Node, Processed,
+    chunk_text, discover_sessions, embed, extract_knowledge, read_transcript, Edge, Node, Processed,
     SessionEvent, SessionInfo, SessionWatcher, SourceType, Store,
 };
 use std::path::PathBuf;
@@ -100,6 +100,42 @@ fn dir_size(path: &PathBuf) -> u64 {
 /// AIDEV-NOTE: 10 bits out of 64 (~15%) means meaningful content change
 const SIMHASH_CHANGE_THRESHOLD: u32 = 10;
 
+/// Similarity threshold for creating edges between nodes
+/// AIDEV-NOTE: 0.6 is relatively permissive - "for serendipity" per spec
+const SIMILARITY_THRESHOLD: f32 = 0.6;
+
+/// Maximum nodes to search when linking
+const MAX_SIMILAR_SEARCH: usize = 20;
+
+/// Link a newly created node to similar existing nodes
+/// Returns number of edges created
+async fn link_node(
+    store: &Store,
+    node: &Node,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let similar = store
+        .search_similar_with_scores(&node.embedding, MAX_SIMILAR_SEARCH)
+        .await?;
+
+    let mut edges_created = 0;
+    for (other, similarity) in similar {
+        // Skip self-links
+        if other.id == node.id {
+            continue;
+        }
+        // Skip if below threshold
+        if similarity < SIMILARITY_THRESHOLD {
+            continue;
+        }
+
+        let edge = Edge::new(node.id, other.id, similarity);
+        store.insert_edge(&edge).await?;
+        edges_created += 1;
+    }
+
+    Ok(edges_created)
+}
+
 /// Process a single session transcript
 /// Returns (nodes_created, skipped) tuple
 async fn process_session(
@@ -170,14 +206,18 @@ async fn process_session(
             hamming
         );
 
-        // Delete old nodes and processed record
+        // Delete old nodes and their edges, then processed record
         let node_ids: Vec<Uuid> = existing.node_ids
             .iter()
             .filter_map(|id| id.parse::<Uuid>().ok())
             .collect();
         if !node_ids.is_empty() {
+            // Delete edges first (referential integrity)
+            for node_id in &node_ids {
+                store.delete_edges_for_node(*node_id).await?;
+            }
             store.delete_nodes(&node_ids).await?;
-            println!("  Deleted {} old node(s)", node_ids.len());
+            println!("  Deleted {} old node(s) and their edges", node_ids.len());
         }
         store.delete_processed(&session.session_id).await?;
     }
@@ -217,6 +257,7 @@ async fn process_session(
     // Embed and store each insight as a separate node
     let total_insights = extraction.insights.len();
     let mut node_ids = Vec::new();
+    let mut total_edges = 0;
     for (i, insight) in extraction.insights.into_iter().enumerate() {
         println!("  Embedding insight {}/{}...", i + 1, total_insights);
         let embedding = embed(&insight.content).await?;
@@ -230,6 +271,14 @@ async fn process_session(
 
         println!("  Storing node {}...", &node_id[..8]);
         store.insert_node(&node).await?;
+
+        // Link to similar existing nodes
+        let edges = link_node(store, &node).await?;
+        if edges > 0 {
+            println!("  Linked to {} similar node(s)", edges);
+        }
+        total_edges += edges;
+
         node_ids.push(node_id);
     }
 
@@ -244,7 +293,7 @@ async fn process_session(
     };
     store.insert_processed(&record).await?;
 
-    println!("  Done! Created {} node(s)", record.node_count);
+    println!("  Done! Created {} node(s), {} edge(s)", record.node_count, total_edges);
     Ok((record.node_count as usize, false))
 }
 
@@ -292,14 +341,18 @@ async fn process_file(
             hamming
         );
 
-        // Delete old nodes and processed record
+        // Delete old nodes and their edges, then processed record
         let node_ids: Vec<Uuid> = existing.node_ids
             .iter()
             .filter_map(|id| id.parse::<Uuid>().ok())
             .collect();
         if !node_ids.is_empty() {
+            // Delete edges first (referential integrity)
+            for node_id in &node_ids {
+                store.delete_edges_for_node(*node_id).await?;
+            }
             store.delete_nodes(&node_ids).await?;
-            println!("  Deleted {} old node(s)", node_ids.len());
+            println!("  Deleted {} old node(s) and their edges", node_ids.len());
         }
         store.delete_processed(&source_id).await?;
     }
@@ -310,6 +363,7 @@ async fn process_file(
 
     // Embed each chunk and create nodes
     let mut node_ids = Vec::new();
+    let mut total_edges = 0;
     for (i, chunk) in chunks.iter().enumerate() {
         println!("  Embedding chunk {}/{}...", i + 1, chunks.len());
         let embedding = embed(chunk).await?;
@@ -323,6 +377,14 @@ async fn process_file(
         );
         let node_id = node.id.to_string();
         store.insert_node(&node).await?;
+
+        // Link to similar existing nodes
+        let edges = link_node(store, &node).await?;
+        if edges > 0 {
+            println!("  Linked to {} similar node(s)", edges);
+        }
+        total_edges += edges;
+
         node_ids.push(node_id);
     }
 
@@ -337,7 +399,7 @@ async fn process_file(
     };
     store.insert_processed(&record).await?;
 
-    println!("  Done! Created {} node(s)", record.node_count);
+    println!("  Done! Created {} node(s), {} edge(s)", record.node_count, total_edges);
     Ok(record.node_count as usize)
 }
 

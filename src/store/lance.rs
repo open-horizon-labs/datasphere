@@ -4,7 +4,7 @@ use arrow_array::{
 };
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
-use lancedb::{connect, Connection, Table, query::{QueryBase, ExecutableQuery}};
+use lancedb::{connect, Connection, Table, query::{QueryBase, ExecutableQuery}, DistanceType};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -104,6 +104,36 @@ impl Store {
         Ok(nodes)
     }
 
+    /// Search for similar nodes and return with similarity scores
+    /// AIDEV-NOTE: Uses cosine distance. Similarity = 1.0 - distance.
+    /// OpenAI embeddings are normalized, so cosine distance is appropriate.
+    pub async fn search_similar_with_scores(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(Node, f32)>, lancedb::Error> {
+        let mut results = self
+            .nodes
+            .vector_search(embedding)?
+            .distance_type(DistanceType::Cosine)
+            .limit(limit)
+            .execute()
+            .await?;
+
+        let mut nodes_with_scores = Vec::new();
+        while let Some(batch) = results.try_next().await? {
+            let nodes = batch_to_nodes(&batch)?;
+            let distances = extract_distances(&batch)?;
+
+            for (node, distance) in nodes.into_iter().zip(distances.into_iter()) {
+                // Cosine distance to similarity: similarity = 1.0 - distance
+                let similarity = 1.0 - distance;
+                nodes_with_scores.push((node, similarity));
+            }
+        }
+        Ok(nodes_with_scores)
+    }
+
     pub async fn get_edges_for(&self, node_id: Uuid) -> Result<Vec<Edge>, lancedb::Error> {
         let id_str = node_id.to_string();
         let filter = format!(
@@ -167,6 +197,17 @@ impl Store {
             let filter = format!("id = '{}'", id);
             self.nodes.delete(&filter).await?;
         }
+        Ok(())
+    }
+
+    /// Delete all edges connected to a node (for cleanup on re-processing)
+    pub async fn delete_edges_for_node(&self, node_id: Uuid) -> Result<(), lancedb::Error> {
+        let id_str = node_id.to_string();
+        let filter = format!(
+            "source_node = '{}' OR target_node = '{}'",
+            id_str, id_str
+        );
+        self.edges.delete(&filter).await?;
         Ok(())
     }
 
@@ -427,6 +468,25 @@ fn batch_to_nodes(batch: &RecordBatch) -> Result<Vec<Node>, lancedb::Error> {
     }
 
     Ok(nodes)
+}
+
+/// Extract _distance column from vector search results
+fn extract_distances(batch: &RecordBatch) -> Result<Vec<f32>, lancedb::Error> {
+    // LanceDB adds _distance column to vector search results
+    let distance_col = batch
+        .column_by_name("_distance")
+        .ok_or_else(|| lancedb::Error::InvalidInput {
+            message: "_distance column not found in vector search results".to_string(),
+        })?;
+
+    let distances = distance_col
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| lancedb::Error::InvalidInput {
+            message: "_distance column is not Float32".to_string(),
+        })?;
+
+    Ok(distances.values().to_vec())
 }
 
 fn batch_to_edges(batch: &RecordBatch) -> Result<Vec<Edge>, lancedb::Error> {
