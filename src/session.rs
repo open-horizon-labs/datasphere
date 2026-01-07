@@ -88,6 +88,13 @@ pub fn discover_sessions_in_dir(project_dir: &Path) -> Result<Vec<SessionInfo>, 
             // Session ID is the filename without extension
             let session_id = path.file_stem()?.to_str()?.to_string();
 
+            // Skip agent sessions (Task tool subagent transcripts)
+            // AIDEV-NOTE: Agent sessions start with "agent-" and are typically
+            // short, focused tool invocations - not valuable for knowledge extraction.
+            if session_id.starts_with("agent-") {
+                return None;
+            }
+
             // Get metadata for timestamps and size
             let metadata = std::fs::metadata(&path).ok()?;
             let modified = metadata.modified().ok()?;
