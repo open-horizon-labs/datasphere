@@ -33,7 +33,8 @@ pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, S
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .env("WM_DISABLED", "1")
-        .env("SUPEREGO_DISABLED", "1");
+        .env("SUPEREGO_DISABLED", "1")
+        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "16000");
 
     let output = cmd
         .output()
