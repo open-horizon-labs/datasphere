@@ -1,13 +1,13 @@
 [package]
-name = "engram"
+name = "datasphere"
 version = "0.1.0"
 edition = "2024"
-description = "Background daemon that distills and links knowledge from local sources"
+description = "Background daemon that distills knowledge from Claude Code sessions into a searchable graph"
 license = "LicenseRef-Proprietary"
-repository = "https://github.com/cloud-atlas-ai/engram"
+repository = "https://github.com/cloud-atlas-ai/datasphere"
 
 [[bin]]
-name = "engram"
+name = "ds"
 path = "src/main.rs"
 
 [dependencies]

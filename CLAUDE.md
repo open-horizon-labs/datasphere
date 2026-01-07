@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-Engram — background daemon that distills knowledge from Claude Code sessions.
+Datasphere — background daemon that distills knowledge from Claude Code sessions.
+
+Named after the AI knowledge network in Dan Simmons' Hyperion Cantos.
 
 ## Build & Test
 
@@ -30,7 +32,7 @@ cargo test               # Run tests
 | Component | Purpose |
 |-----------|---------|
 | AllProjectsWatcher | Watch `~/.claude/projects/` recursively for `.jsonl` changes |
-| Queue | Persistent JSONL queue at `~/.engram/queue.jsonl` |
+| Queue | Persistent JSONL queue at `~/.datasphere/queue.jsonl` |
 | Distiller | Extract insights via LLM (chunked, no synthesis) |
 | Embedder | Text embeddings (1536 dims) |
 | Store | LanceDB (nodes, processed tables) |
@@ -39,7 +41,7 @@ cargo test               # Run tests
 
 ```
 src/
-├── main.rs           # CLI: scan, start, query, queue, stats, show, add
+├── main.rs           # CLI: scan, start, query, queue, stats, show, add, reset
 ├── lib.rs            # Public exports
 ├── core/
 │   └── node.rs       # Node type (EMBEDDING_DIM = 1536)
@@ -62,7 +64,7 @@ src/
 ## Storage
 
 ```
-~/.engram/
+~/.datasphere/
 ├── db/               # LanceDB database
 │   ├── nodes.lance/
 │   └── processed.lance/
@@ -80,26 +82,28 @@ src/
 ## CLI Commands
 
 ```bash
-engram scan              # One-shot scan current project
-engram start             # Daemon: watch all projects
-engram query "text"      # Search knowledge graph
-engram query -f json "x" # JSON output for MCP
-engram queue             # Show queue counts
-engram queue pending     # List pending jobs
-engram queue clear       # Remove completed jobs
-engram stats             # Database statistics
-engram show              # Display nodes
-engram add <file>        # Add file (no LLM, direct embed)
-engram related <id>      # Find nodes similar to a node
+ds scan              # One-shot scan current project
+ds start             # Daemon: watch all projects
+ds query "text"      # Search knowledge graph
+ds query -f json "x" # JSON output for MCP
+ds queue             # Show queue counts
+ds queue pending     # List pending jobs
+ds queue clear       # Remove completed jobs
+ds queue nuke        # Delete all jobs
+ds stats             # Database statistics
+ds show              # Display nodes
+ds add <file>        # Add file (no LLM, direct embed)
+ds related <id>      # Find nodes similar to a node
+ds reset             # Delete db + nuke queue (fresh start)
 ```
 
 ## MCP Server
 
-`mcp/` contains Node.js MCP server that shells out to `engram` CLI:
+`mcp/` contains Node.js MCP server that shells out to `ds` CLI:
 
 ```bash
 cd mcp && npm install
-claude mcp add engram -s user -- node /path/to/mcp/index.js
+claude mcp add datasphere -s user -- node /path/to/mcp/index.js
 ```
 
 No build step required — pure JavaScript (ES modules).
@@ -108,8 +112,8 @@ No build step required — pure JavaScript (ES modules).
 
 | Tool | Description |
 |------|-------------|
-| `engram_query(query, limit?)` | Search knowledge graph by text |
-| `engram_related(node_id, limit?)` | Find nodes similar to a given node |
+| `datasphere_query(query, limit?)` | Search knowledge graph by text |
+| `datasphere_related(node_id, limit?)` | Find nodes similar to a given node |
 
 ## Design Principles
 

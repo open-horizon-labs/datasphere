@@ -1,6 +1,6 @@
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use engram::{
+use datasphere::{
     chunk_text, discover_sessions, discover_sessions_in_dir, embed, extract_knowledge,
     list_all_projects, read_transcript, AllProjectsWatcher, Job, JobStatus, Node, Processed,
     Queue, SessionInfo, SourceType, Store,
@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "engram")]
-#[command(about = "Background daemon that distills knowledge from local sources")]
+#[command(name = "ds")]
+#[command(about = "Datasphere - distills knowledge from Claude Code sessions")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -103,7 +103,7 @@ enum QueueAction {
 fn default_db_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".engram")
+        .join(".datasphere")
         .join("db")
 }
 
@@ -194,7 +194,7 @@ async fn process_session(
     );
 
     // Format context for LLM
-    let context = engram::format_context(&messages);
+    let context = datasphere::format_context(&messages);
     if context.trim().is_empty() {
         println!("  Empty context after formatting, skipping");
         return Ok((0, true));
@@ -409,7 +409,7 @@ async fn run_scan(
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     });
 
-    println!("engram scan");
+    println!("ds scan");
     println!("===========");
     println!("Project: {}", project_path.display());
 
@@ -488,7 +488,7 @@ const JOB_DELAY_MS: u64 = 500;
 
 /// Run start command - daemon mode watching all projects
 async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
-    println!("engram start");
+    println!("ds start");
     println!("============");
 
     // Open store
@@ -660,7 +660,7 @@ fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Erro
     match action.unwrap_or(QueueAction::Status) {
         QueueAction::Status => {
             let (pending, processing, done, failed) = queue.counts()?;
-            println!("engram queue");
+            println!("ds queue");
             println!("============");
             println!("Pending:    {}", pending);
             println!("Processing: {}", processing);
@@ -841,7 +841,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !db_path.exists() {
                 println!("Database not found at: {}", db_path.display());
-                println!("Run engram scan to create the database.");
+                println!("Run 'ds scan' to create the database.");
                 return Ok(());
             }
 
@@ -851,7 +851,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let processed = store.count_processed().await?;
             let db_size = dir_size(&db_path);
 
-            println!("engram stats");
+            println!("ds stats");
             println!("============");
             println!("Database:   {}", db_path.display());
             println!("Size:       {}", format_size(db_size));
@@ -907,7 +907,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let db_path = default_db_path();
             let store = Store::open(db_path.to_str().unwrap()).await?;
 
-            println!("engram add");
+            println!("ds add");
             println!("==========");
 
             match process_file(&store, &file).await {
@@ -931,7 +931,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Reset => {
-            println!("engram reset");
+            println!("ds reset");
             println!("============");
 
             // Delete database
@@ -953,7 +953,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Queue was empty");
             }
 
-            println!("\nReset complete. Run 'engram start' to begin fresh.");
+            println!("\nReset complete. Run 'ds start' to begin fresh.");
         }
     }
 

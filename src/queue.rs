@@ -1,6 +1,6 @@
 //! Persistent job queue for daemon processing
 //!
-//! AIDEV-NOTE: Append-only JSONL file at ~/.engram/queue.jsonl
+//! AIDEV-NOTE: Append-only JSONL file at ~/.datasphere/queue.jsonl
 //! Latest entry per source_id wins (allows status updates without rewriting).
 //! Supports pending → processing → done/failed transitions.
 
@@ -47,16 +47,16 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Open or create queue at the default location (~/.engram/queue.jsonl)
+    /// Open or create queue at the default location (~/.datasphere/queue.jsonl)
     pub fn open_default() -> Result<Self, String> {
-        let engram_dir = dirs::home_dir()
+        let ds_dir = dirs::home_dir()
             .ok_or("Could not determine home directory")?
-            .join(".engram");
+            .join(".datasphere");
 
-        std::fs::create_dir_all(&engram_dir)
-            .map_err(|e| format!("Failed to create engram directory: {}", e))?;
+        std::fs::create_dir_all(&ds_dir)
+            .map_err(|e| format!("Failed to create datasphere directory: {}", e))?;
 
-        let path = engram_dir.join("queue.jsonl");
+        let path = ds_dir.join("queue.jsonl");
         Ok(Self { path })
     }
 

@@ -2136,6 +2136,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "datasphere"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "clap",
+ "dirs",
+ "futures",
+ "lancedb",
+ "notify",
+ "reqwest 0.13.1",
+ "semchunk-rs",
+ "serde",
+ "serde_json",
+ "simhash",
+ "tempfile",
+ "tiktoken-rs",
+ "tokio",
+ "uuid",
+ "walkdir",
+ "which",
+]
+
+[[package]]
 name = "deepsize"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2270,31 +2295,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "engram"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "chrono",
- "clap",
- "dirs",
- "futures",
- "lancedb",
- "notify",
- "reqwest 0.13.1",
- "semchunk-rs",
- "serde",
- "serde_json",
- "simhash",
- "tempfile",
- "tiktoken-rs",
- "tokio",
- "uuid",
- "walkdir",
- "which",
 ]
 
 [[package]]

@@ -1,11 +1,11 @@
 {
-  "name": "engram-mcp",
+  "name": "datasphere-mcp",
   "version": "0.1.0",
-  "description": "MCP server for engram knowledge graph queries",
+  "description": "MCP server for datasphere knowledge graph queries",
   "type": "module",
   "main": "index.js",
   "bin": {
-    "engram-mcp": "./index.js"
+    "datasphere-mcp": "./index.js"
   },
   "scripts": {
     "start": "node index.js"

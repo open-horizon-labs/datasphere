@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Engram MCP Server
+ * Datasphere MCP Server
  *
- * Minimal MCP server that exposes engram_query tool.
- * Shells out to `engram query` CLI command.
+ * Minimal MCP server that exposes datasphere query tools.
+ * Shells out to `ds` CLI command.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -15,9 +15,9 @@ import {
 import { execSync } from 'child_process';
 
 const SERVER_INSTRUCTIONS = `
-Engram MCP Server - Knowledge Graph Queries
+Datasphere MCP Server - Knowledge Graph Queries
 
-Use engram_query to search your distilled knowledge graph for relevant insights.
+Use datasphere_query to search your distilled knowledge graph for relevant insights.
 The knowledge graph contains extracted learnings from your Claude Code sessions.
 
 Example queries:
@@ -27,7 +27,7 @@ Example queries:
 `.trim();
 
 const server = new Server(
-  { name: 'engram', version: '0.1.0' },
+  { name: 'datasphere', version: '0.1.0' },
   {
     capabilities: { tools: {} },
     instructions: SERVER_INSTRUCTIONS
@@ -38,8 +38,8 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: 'engram_query',
-      description: 'Search the engram knowledge graph for relevant insights from past sessions',
+      name: 'datasphere_query',
+      description: 'Search the datasphere knowledge graph for relevant insights from past sessions',
       inputSchema: {
         type: 'object',
         properties: {
@@ -57,7 +57,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       }
     },
     {
-      name: 'engram_related',
+      name: 'datasphere_related',
       description: 'Find nodes similar to a specific node in the knowledge graph',
       inputSchema: {
         type: 'object',
@@ -82,12 +82,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  if (name === 'engram_query') {
+  if (name === 'datasphere_query') {
     const { query, limit = 5 } = args;
 
     try {
       const result = execSync(
-        `engram query --format json --limit ${limit} ${JSON.stringify(query)}`,
+        `ds query --format json --limit ${limit} ${JSON.stringify(query)}`,
         { encoding: 'utf-8', timeout: 30000 }
       );
 
@@ -116,18 +116,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
       return {
-        content: [{ type: 'text', text: `Error querying engram: ${message}` }],
+        content: [{ type: 'text', text: `Error querying datasphere: ${message}` }],
         isError: true
       };
     }
   }
 
-  if (name === 'engram_related') {
+  if (name === 'datasphere_related') {
     const { node_id, limit = 5 } = args;
 
     try {
       const result = execSync(
-        `engram related --format json --limit ${limit} ${node_id}`,
+        `ds related --format json --limit ${limit} ${node_id}`,
         { encoding: 'utf-8', timeout: 30000 }
       );
 
@@ -173,7 +173,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('Engram MCP server running on stdio');
+  console.error('Datasphere MCP server running on stdio');
 }
 
 main().catch((error) => {
