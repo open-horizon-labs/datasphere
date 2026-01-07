@@ -19,7 +19,10 @@ Datasphere watches your Claude Code sessions, extracts insights via LLM distilla
 ## Installation
 
 ```bash
-# Build and install CLI
+# From crates.io
+cargo install datasphere
+
+# Or from source
 cargo install --path .
 
 # Verify
