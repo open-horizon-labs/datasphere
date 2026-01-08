@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use datasphere::{
     chunk_text, discover_sessions, discover_sessions_in_dir, embed, extract_knowledge,
@@ -41,7 +41,17 @@ enum Commands {
     },
 
     /// Start the daemon (watches all projects)
-    Start,
+    Start {
+        /// Run in foreground instead of daemonizing
+        #[arg(short, long)]
+        foreground: bool,
+    },
+
+    /// Stop the running daemon
+    Stop,
+
+    /// Show daemon status
+    Status,
 
     /// Show or manage the job queue
     Queue {
@@ -105,6 +115,47 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".datasphere")
         .join("db")
+}
+
+/// Get the daemon PID file path
+fn daemon_pid_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".datasphere")
+        .join("daemon.pid")
+}
+
+/// Get the daemon log file path
+fn daemon_log_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".datasphere")
+        .join("daemon.log")
+}
+
+/// Check if daemon is running, returns PID if running
+fn is_daemon_running() -> Option<u32> {
+    let pid_path = daemon_pid_path();
+    if !pid_path.exists() {
+        return None;
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_path).ok()?;
+    let pid: u32 = pid_str.trim().parse().ok()?;
+
+    // Check if process is actually running
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) checks if process exists without sending a signal
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        if result == 0 {
+            return Some(pid);
+        }
+    }
+
+    // PID file exists but process is dead - clean up
+    let _ = std::fs::remove_file(&pid_path);
+    None
 }
 
 /// Format bytes as human-readable size
@@ -486,8 +537,101 @@ async fn run_scan(
 /// Delay between processing jobs (rate limiting)
 const JOB_DELAY_MS: u64 = 500;
 
-/// Run start command - daemon mode watching all projects
-async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
+/// Start daemon in background
+fn run_start_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    // Check if already running
+    if let Some(pid) = is_daemon_running() {
+        println!("Daemon already running (PID {})", pid);
+        return Ok(());
+    }
+
+    // Get path to current executable
+    let exe = std::env::current_exe()?;
+    let log_path = daemon_log_path();
+
+    // Ensure .datasphere directory exists
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Open log file (truncate on start)
+    let log_file = std::fs::File::create(&log_path)?;
+
+    // Spawn daemon process with stdout/stderr redirected to log file
+    let child = std::process::Command::new(&exe)
+        .arg("start")
+        .arg("--foreground")
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .stdin(std::process::Stdio::null())
+        .spawn()?;
+
+    // Write PID file
+    let pid = child.id();
+    std::fs::write(daemon_pid_path(), pid.to_string())?;
+
+    println!("Daemon started (PID {})", pid);
+    println!("Log: {}", log_path.display());
+
+    Ok(())
+}
+
+/// Stop running daemon
+fn run_stop() -> Result<(), Box<dyn std::error::Error>> {
+    match is_daemon_running() {
+        Some(pid) => {
+            #[cfg(unix)]
+            {
+                // Send SIGTERM
+                let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                if result == 0 {
+                    println!("Stopping daemon (PID {})", pid);
+
+                    // Wait briefly for graceful shutdown
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+
+                    // Check if still running
+                    if is_daemon_running().is_some() {
+                        println!("Daemon still running, sending SIGKILL...");
+                        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    }
+
+                    // Clean up PID file
+                    let _ = std::fs::remove_file(daemon_pid_path());
+                    println!("Daemon stopped");
+                } else {
+                    eprintln!("Failed to stop daemon: {}", std::io::Error::last_os_error());
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                eprintln!("Stop not supported on this platform");
+            }
+        }
+        None => {
+            println!("Daemon not running");
+        }
+    }
+    Ok(())
+}
+
+/// Show daemon status
+fn run_status() -> Result<(), Box<dyn std::error::Error>> {
+    match is_daemon_running() {
+        Some(pid) => {
+            println!("Daemon running (PID {})", pid);
+            println!("Log: {}", daemon_log_path().display());
+        }
+        None => {
+            println!("Daemon not running");
+        }
+    }
+    Ok(())
+}
+
+/// Run start command - daemon mode watching all projects (foreground)
+async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     println!("ds start");
     println!("============");
 
@@ -557,15 +701,40 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("Watching: {}", watcher.projects_dir().display());
 
-    // Stats (prefixed with _ since loop is infinite, never printed)
-    let mut _queued_count = 0;
-    let mut _processed_count = 0;
-    let mut _total_nodes = 0;
+    // Stats
+    let mut queued_count = 0;
+    let mut processed_count = 0;
+    let mut total_nodes = 0;
 
     println!("\nDaemon running (Ctrl+C to stop)...\n");
 
+    // Set up signal handling for graceful shutdown
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut shutdown = false;
+
     // Main loop: poll for watcher events, process queue
-    loop {
+    while !shutdown {
+        // Check for shutdown signals
+        #[cfg(unix)]
+        {
+            use tokio::time::timeout;
+            // Non-blocking check for SIGTERM
+            if let Ok(Some(())) = timeout(Duration::from_millis(0), sigterm.recv()).await {
+                println!("\n[SHUTDOWN] Received SIGTERM, shutting down...");
+                shutdown = true;
+                continue;
+            }
+        }
+        // Check for Ctrl+C (cross-platform)
+        {
+            use tokio::time::timeout;
+            if let Ok(Ok(())) = timeout(Duration::from_millis(0), tokio::signal::ctrl_c()).await {
+                println!("\n[SHUTDOWN] Received Ctrl+C, shutting down...");
+                shutdown = true;
+                continue;
+            }
+        }
         // Drain all pending watcher events into queue
         while let Some(event) = watcher.try_recv() {
             // Skip empty transcripts
@@ -585,7 +754,7 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
 
             match queue.add(job) {
                 Ok(true) => {
-                    _queued_count += 1;
+                    queued_count += 1;
                     println!(
                         "[QUEUE] {} ({}) from {}",
                         &event.session.session_id[..8.min(event.session.session_id.len())],
@@ -601,7 +770,8 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
         // Process one job from queue
         if let Ok(Some(job)) = queue.pop_pending() {
             println!(
-                "[PROCESS] {} from {}",
+                "[{}] [PROCESS] {} from {}",
+                Local::now().format("%H:%M:%S"),
                 &job.source_id[..8.min(job.source_id.len())],
                 &job.project_id
             );
@@ -622,8 +792,8 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  Failed to mark done: {}", e);
                     }
                     if !was_skipped {
-                        _processed_count += 1;
-                        _total_nodes += nodes;
+                        processed_count += 1;
+                        total_nodes += nodes;
                     }
                 }
                 Err(e) => {
@@ -642,15 +812,14 @@ async fn run_start() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Note: This is unreachable but kept for completeness
-    #[allow(unreachable_code)]
-    {
-        println!("\nDaemon stopped.");
-        println!("  Queued:    {} sessions", _queued_count);
-        println!("  Processed: {} sessions", _processed_count);
-        println!("  Nodes:     {} created", _total_nodes);
-        Ok(())
-    }
+    // Clean up PID file on graceful shutdown
+    let _ = std::fs::remove_file(daemon_pid_path());
+
+    println!("\nDaemon stopped.");
+    println!("  Queued:    {} sessions", queued_count);
+    println!("  Processed: {} sessions", processed_count);
+    println!("  Nodes:     {} created", total_nodes);
+    Ok(())
 }
 
 /// Run queue command - show/manage job queue
@@ -890,8 +1059,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_scan(project, limit).await?;
         }
 
-        Commands::Start => {
-            run_start().await?;
+        Commands::Start { foreground } => {
+            if foreground {
+                run_start_foreground().await?;
+            } else {
+                run_start_daemon()?;
+            }
+        }
+
+        Commands::Stop => {
+            run_stop()?;
+        }
+
+        Commands::Status => {
+            run_status()?;
         }
 
         Commands::Queue { action } => {

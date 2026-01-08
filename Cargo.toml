@@ -1,6 +1,6 @@
 [package]
 name = "datasphere"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Background daemon that distills knowledge from Claude Code sessions into a searchable graph"
 license = "LicenseRef-Proprietary"
@@ -30,7 +30,7 @@ arrow-array = "56"
 arrow-schema = "56"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "signal"] }
 futures = "0.3"
 
 # HTTP client for OpenAI API
@@ -52,6 +52,9 @@ notify = "8.2.0"
 dirs = "6"
 walkdir = "2"
 which = "7"
+
+# Unix process management
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
