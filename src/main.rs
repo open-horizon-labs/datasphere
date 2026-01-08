@@ -218,6 +218,25 @@ impl DaemonLog {
     }
 }
 
+/// Global logger for daemon mode (None = use stdout)
+static DAEMON_LOGGER: std::sync::Mutex<Option<DaemonLog>> = std::sync::Mutex::new(None);
+
+/// Log a message - writes to daemon log file if in daemon mode, otherwise stdout
+macro_rules! dlog {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if let Ok(mut guard) = DAEMON_LOGGER.lock() {
+            if let Some(ref mut logger) = *guard {
+                logger.log(&msg);
+            } else {
+                println!("{}", msg);
+            }
+        } else {
+            println!("{}", msg);
+        }
+    }};
+}
+
 /// Check if daemon is running, returns PID if running
 fn is_daemon_running() -> Option<u32> {
     let pid_path = daemon_pid_path();
@@ -294,14 +313,14 @@ async fn process_session(
     store: &Store,
     session: &SessionInfo,
 ) -> Result<(usize, bool), Box<dyn std::error::Error>> {
-    println!("  Reading transcript...");
+    dlog!("  Reading transcript...");
 
     // Parse transcript
     let entries = read_transcript(&session.transcript_path)?;
-    println!("  Parsed {} entries", entries.len());
+    dlog!("  Parsed {} entries", entries.len());
 
     if entries.is_empty() {
-        println!("  Empty transcript, skipping");
+        dlog!("  Empty transcript, skipping");
         return Ok((0, true));
     }
 
@@ -312,7 +331,7 @@ async fn process_session(
         .collect();
 
     if messages.is_empty() {
-        println!("  No messages found, skipping");
+        dlog!("  No messages found, skipping");
         return Ok((0, true));
     }
 
@@ -321,7 +340,7 @@ async fn process_session(
     let assistant_count = messages.iter().filter(|e| e.is_assistant()).count();
     let summary_count = messages.iter().filter(|e| e.is_summary()).count();
 
-    println!(
+    dlog!(
         "  Collected {} items ({} user, {} assistant, {} summaries)",
         messages.len(),
         user_count,
@@ -332,11 +351,11 @@ async fn process_session(
     // Format context for LLM
     let context = datasphere::format_context(&messages);
     if context.trim().is_empty() {
-        println!("  Empty context after formatting, skipping");
+        dlog!("  Empty context after formatting, skipping");
         return Ok((0, true));
     }
 
-    println!("  Context size: {} chars", context.len());
+    dlog!("  Context size: {} chars", context.len());
 
     // Compute SimHash of context
     let current_simhash = simhash::simhash(&context) as i64;
@@ -346,14 +365,14 @@ async fn process_session(
         let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
 
         if hamming <= SIMHASH_CHANGE_THRESHOLD {
-            println!(
+            dlog!(
                 "  Unchanged (simhash distance: {} bits, threshold: {})",
                 hamming, SIMHASH_CHANGE_THRESHOLD
             );
             return Ok((0, true));
         }
 
-        println!(
+        dlog!(
             "  Session changed (simhash distance: {} bits), re-distilling...",
             hamming
         );
@@ -365,18 +384,18 @@ async fn process_session(
             .collect();
         if !node_ids.is_empty() {
             store.delete_nodes(&node_ids).await?;
-            println!("  Deleted {} old node(s)", node_ids.len());
+            dlog!("  Deleted {} old node(s)", node_ids.len());
         }
         store.delete_processed(&session.session_id).await?;
     }
 
     // Distill knowledge via LLM
-    println!("  Distilling via LLM...");
+    dlog!("  Distilling via LLM...");
     let distill_start = Instant::now();
     let extraction = match extract_knowledge(&context).await {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("  LLM extraction failed: {}", e);
+            dlog!("  LLM extraction failed: {}", e);
             return Err(e.into());
         }
     };
@@ -384,13 +403,13 @@ async fn process_session(
 
     // Log chunking info if used
     if extraction.chunks_used > 1 {
-        println!("  Distilled {} chunks in {:.1}s", extraction.chunks_used, distill_elapsed.as_secs_f32());
+        dlog!("  Distilled {} chunks in {:.1}s", extraction.chunks_used, distill_elapsed.as_secs_f32());
     } else {
-        println!("  Distilled in {:.1}s", distill_elapsed.as_secs_f32());
+        dlog!("  Distilled in {:.1}s", distill_elapsed.as_secs_f32());
     }
 
     if extraction.insights.is_empty() {
-        println!("  No substantive knowledge found");
+        dlog!("  No substantive knowledge found");
         // Still record as processed
         let record = Processed {
             source_id: session.session_id.clone(),
@@ -404,7 +423,7 @@ async fn process_session(
         return Ok((0, false));
     }
 
-    println!("  Extracted {} insight(s)", extraction.insights.len());
+    dlog!("  Extracted {} insight(s)", extraction.insights.len());
 
     // Embed and store each insight as a separate node
     let total_insights = extraction.insights.len();
@@ -412,7 +431,7 @@ async fn process_session(
     for (i, insight) in extraction.insights.into_iter().enumerate() {
         let embed_start = Instant::now();
         let embedding = embed(&insight.content).await?;
-        println!("  Embedded {}/{} in {:.1}s", i + 1, total_insights, embed_start.elapsed().as_secs_f32());
+        dlog!("  Embedded {}/{} in {:.1}s", i + 1, total_insights, embed_start.elapsed().as_secs_f32());
 
         let node = insight.into_node(
             session.session_id.clone(),
@@ -437,7 +456,7 @@ async fn process_session(
     };
     store.insert_processed(&record).await?;
 
-    println!("  Done! Created {} node(s)", record.node_count);
+    dlog!("  Done! Created {} node(s)", record.node_count);
     Ok((record.node_count as usize, false))
 }
 
@@ -452,18 +471,18 @@ async fn process_file(
         .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
     let source_id = canonical_path.to_string_lossy().to_string();
 
-    println!("Processing file: {}", canonical_path.display());
+    dlog!("Processing file: {}", canonical_path.display());
 
     // Read file content
     let content = std::fs::read_to_string(&canonical_path)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
     if content.trim().is_empty() {
-        println!("  Empty file, skipping");
+        dlog!("  Empty file, skipping");
         return Ok(0);
     }
 
-    println!("  File size: {} chars", content.len());
+    dlog!("  File size: {} chars", content.len());
 
     // Compute SimHash
     let current_simhash = simhash::simhash(&content) as i64;
@@ -473,14 +492,14 @@ async fn process_file(
         let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
 
         if hamming <= SIMHASH_CHANGE_THRESHOLD {
-            println!(
+            dlog!(
                 "  Unchanged (simhash distance: {} bits, threshold: {})",
                 hamming, SIMHASH_CHANGE_THRESHOLD
             );
             return Ok(0);
         }
 
-        println!(
+        dlog!(
             "  File changed (simhash distance: {} bits), re-embedding...",
             hamming
         );
@@ -492,21 +511,21 @@ async fn process_file(
             .collect();
         if !node_ids.is_empty() {
             store.delete_nodes(&node_ids).await?;
-            println!("  Deleted {} old node(s)", node_ids.len());
+            dlog!("  Deleted {} old node(s)", node_ids.len());
         }
         store.delete_processed(&source_id).await?;
     }
 
     // Chunk content if needed
     let chunks = chunk_text(&content);
-    println!("  Chunks: {}", chunks.len());
+    dlog!("  Chunks: {}", chunks.len());
 
     // Embed each chunk and create nodes
     let mut node_ids = Vec::new();
     for (i, chunk) in chunks.iter().enumerate() {
         let embed_start = Instant::now();
         let embedding = embed(chunk).await?;
-        println!("  Embedded {}/{} in {:.1}s", i + 1, chunks.len(), embed_start.elapsed().as_secs_f32());
+        dlog!("  Embedded {}/{} in {:.1}s", i + 1, chunks.len(), embed_start.elapsed().as_secs_f32());
 
         let node = Node::new(
             chunk.clone(),
@@ -532,7 +551,7 @@ async fn process_file(
     };
     store.insert_processed(&record).await?;
 
-    println!("  Done! Created {} node(s)", record.node_count);
+    dlog!("  Done! Created {} node(s)", record.node_count);
     Ok(record.node_count as usize)
 }
 
@@ -714,14 +733,10 @@ fn run_status() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run start command - daemon mode watching all projects (foreground)
 async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logger with daily rotation
-    let mut log = DaemonLog::new()?;
-
-    // Macro for logging to file
-    macro_rules! dlog {
-        ($($arg:tt)*) => {{
-            log.log(&format!($($arg)*));
-        }};
+    // Initialize global logger for daemon mode
+    {
+        let mut guard = DAEMON_LOGGER.lock().unwrap();
+        *guard = Some(DaemonLog::new()?);
     }
 
     dlog!("ds start");
