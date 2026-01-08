@@ -133,6 +133,91 @@ fn daemon_log_path() -> PathBuf {
         .join("daemon.log")
 }
 
+/// Number of old log files to keep
+const LOG_ROTATION_KEEP: usize = 7;
+
+/// Rotate log files: daemon.log -> daemon.log.1 -> daemon.log.2 -> ...
+fn rotate_logs() {
+    let base = daemon_log_path();
+
+    // Delete oldest log if it exists
+    let oldest = base.with_extension(format!("log.{}", LOG_ROTATION_KEEP));
+    let _ = std::fs::remove_file(&oldest);
+
+    // Shift existing logs: .log.N -> .log.N+1
+    for i in (1..LOG_ROTATION_KEEP).rev() {
+        let from = base.with_extension(format!("log.{}", i));
+        let to = base.with_extension(format!("log.{}", i + 1));
+        let _ = std::fs::rename(&from, &to);
+    }
+
+    // Rename current log to .log.1
+    let _ = std::fs::rename(&base, base.with_extension("log.1"));
+}
+
+/// Daemon logger with daily rotation
+struct DaemonLog {
+    file: std::fs::File,
+    current_date: chrono::NaiveDate,
+}
+
+impl DaemonLog {
+    fn new() -> std::io::Result<Self> {
+        let log_path = daemon_log_path();
+
+        // Ensure directory exists
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Open log file in append mode
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+
+        Ok(Self {
+            file,
+            current_date: Local::now().date_naive(),
+        })
+    }
+
+    fn log(&mut self, msg: &str) {
+        use std::io::Write;
+
+        // Check if we need to rotate (new day)
+        let today = Local::now().date_naive();
+        if today != self.current_date {
+            // Flush current file
+            let _ = self.file.flush();
+
+            // Rotate logs
+            rotate_logs();
+
+            // Open new log file
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(daemon_log_path())
+            {
+                Ok(new_file) => {
+                    self.file = new_file;
+                    let _ = writeln!(self.file, "[{}] [ROTATE] New log file for {}", Local::now().format("%H:%M:%S"), today);
+                }
+                Err(_) => {
+                    // Continue writing to old (now renamed) file handle
+                }
+            }
+            // Update date regardless to prevent retry loop
+            self.current_date = today;
+        }
+
+        // Add timestamp to all log entries
+        let _ = writeln!(self.file, "[{}] {}", Local::now().format("%H:%M:%S"), msg);
+        let _ = self.file.flush();
+    }
+}
+
 /// Check if daemon is running, returns PID if running
 fn is_daemon_running() -> Option<u32> {
     let pid_path = daemon_pid_path();
@@ -554,15 +639,12 @@ fn run_start_daemon() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Open log file (truncate on start)
-    let log_file = std::fs::File::create(&log_path)?;
-
-    // Spawn daemon process with stdout/stderr redirected to log file
+    // Spawn daemon process (it manages its own log file with rotation)
     let child = std::process::Command::new(&exe)
         .arg("start")
         .arg("--foreground")
-        .stdout(log_file.try_clone()?)
-        .stderr(log_file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null())
         .spawn()?;
 
@@ -632,12 +714,22 @@ fn run_status() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run start command - daemon mode watching all projects (foreground)
 async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
-    println!("ds start");
-    println!("============");
+    // Initialize logger with daily rotation
+    let mut log = DaemonLog::new()?;
+
+    // Macro for logging to file
+    macro_rules! dlog {
+        ($($arg:tt)*) => {{
+            log.log(&format!($($arg)*));
+        }};
+    }
+
+    dlog!("ds start");
+    dlog!("============");
 
     // Open store
     let db_path = default_db_path();
-    println!("Database: {}", db_path.display());
+    dlog!("Database: {}", db_path.display());
     let store = Store::open(db_path.to_str().unwrap()).await?;
 
     // Open queue
@@ -646,11 +738,11 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     // Resume any pending/processing jobs from previous run
     let (pending, processing, _, _) = queue.counts().unwrap_or((0, 0, 0, 0));
     if pending > 0 || processing > 0 {
-        println!("Resuming {} pending, {} processing jobs from previous run", pending, processing);
+        dlog!("Resuming {} pending, {} processing jobs from previous run", pending, processing);
     }
 
     // Scan existing sessions and queue unprocessed ones
-    println!("\nScanning existing sessions...");
+    dlog!("\nScanning existing sessions...");
     let projects = list_all_projects().unwrap_or_default();
     let mut queued_initial = 0;
 
@@ -685,28 +777,28 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if queued_initial > 0 {
-        println!("Queued {} unprocessed session(s)", queued_initial);
+        dlog!("Queued {} unprocessed session(s)", queued_initial);
     } else {
-        println!("All sessions already processed");
+        dlog!("All sessions already processed");
     }
 
     // Create all-projects watcher
-    println!("\nStarting all-projects watcher...");
+    dlog!("\nStarting all-projects watcher...");
     let watcher = match AllProjectsWatcher::new() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("Failed to create watcher: {}", e);
+            dlog!("Failed to create watcher: {}", e);
             return Ok(());
         }
     };
-    println!("Watching: {}", watcher.projects_dir().display());
+    dlog!("Watching: {}", watcher.projects_dir().display());
 
     // Stats
     let mut queued_count = 0;
     let mut processed_count = 0;
     let mut total_nodes = 0;
 
-    println!("\nDaemon running (Ctrl+C to stop)...\n");
+    dlog!("\nDaemon running (Ctrl+C to stop)...\n");
 
     // Set up signal handling for graceful shutdown
     #[cfg(unix)]
@@ -721,7 +813,7 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
             use tokio::time::timeout;
             // Non-blocking check for SIGTERM
             if let Ok(Some(())) = timeout(Duration::from_millis(0), sigterm.recv()).await {
-                println!("\n[SHUTDOWN] Received SIGTERM, shutting down...");
+                dlog!("\n[SHUTDOWN] Received SIGTERM, shutting down...");
                 shutdown = true;
                 continue;
             }
@@ -730,7 +822,7 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
         {
             use tokio::time::timeout;
             if let Ok(Ok(())) = timeout(Duration::from_millis(0), tokio::signal::ctrl_c()).await {
-                println!("\n[SHUTDOWN] Received Ctrl+C, shutting down...");
+                dlog!("\n[SHUTDOWN] Received Ctrl+C, shutting down...");
                 shutdown = true;
                 continue;
             }
@@ -755,7 +847,7 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
             match queue.add(job) {
                 Ok(true) => {
                     queued_count += 1;
-                    println!(
+                    dlog!(
                         "[QUEUE] {} ({}) from {}",
                         &event.session.session_id[..8.min(event.session.session_id.len())],
                         if event.is_new { "new" } else { "modified" },
@@ -763,15 +855,14 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 Ok(false) => {} // Duplicate, already queued
-                Err(e) => eprintln!("Failed to queue job: {}", e),
+                Err(e) => dlog!("Failed to queue job: {}", e),
             }
         }
 
         // Process one job from queue
         if let Ok(Some(job)) = queue.pop_pending() {
-            println!(
-                "[{}] [PROCESS] {} from {}",
-                Local::now().format("%H:%M:%S"),
+            dlog!(
+                "[PROCESS] {} from {}",
                 &job.source_id[..8.min(job.source_id.len())],
                 &job.project_id
             );
@@ -789,7 +880,7 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
             match process_session(&store, &session).await {
                 Ok((nodes, was_skipped)) => {
                     if let Err(e) = queue.mark_done(&job.source_id) {
-                        eprintln!("  Failed to mark done: {}", e);
+                        dlog!("  Failed to mark done: {}", e);
                     }
                     if !was_skipped {
                         processed_count += 1;
@@ -797,9 +888,9 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("  Error: {}", e);
+                    dlog!("  Error: {}", e);
                     if let Err(e2) = queue.mark_failed(&job.source_id, &e.to_string()) {
-                        eprintln!("  Failed to mark failed: {}", e2);
+                        dlog!("  Failed to mark failed: {}", e2);
                     }
                 }
             }
@@ -815,10 +906,10 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     // Clean up PID file on graceful shutdown
     let _ = std::fs::remove_file(daemon_pid_path());
 
-    println!("\nDaemon stopped.");
-    println!("  Queued:    {} sessions", queued_count);
-    println!("  Processed: {} sessions", processed_count);
-    println!("  Nodes:     {} created", total_nodes);
+    dlog!("\nDaemon stopped.");
+    dlog!("  Queued:    {} sessions", queued_count);
+    dlog!("  Processed: {} sessions", processed_count);
+    dlog!("  Nodes:     {} created", total_nodes);
     Ok(())
 }
 
