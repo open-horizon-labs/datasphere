@@ -119,6 +119,17 @@ impl Queue {
         Ok(())
     }
 
+    /// Mark a job as pending (for returning processing jobs to the queue)
+    pub fn mark_pending(&self, source_id: &str) -> Result<(), String> {
+        let jobs = self.load_all()?;
+        if let Some(mut job) = jobs.get(source_id).cloned() {
+            job.status = JobStatus::Pending;
+            job.error = None;
+            self.append(&job)?;
+        }
+        Ok(())
+    }
+
     /// List all pending jobs
     pub fn list_pending(&self) -> Result<Vec<Job>, String> {
         let jobs = self.load_all()?;
@@ -302,5 +313,39 @@ mod tests {
 
         let pending = queue.list_pending().unwrap();
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn test_mark_pending() {
+        let (queue, _dir) = test_queue();
+
+        let job = Job {
+            source_id: "test-123".to_string(),
+            source_type: "session".to_string(),
+            project_id: "-test-project".to_string(),
+            transcript_path: "/path/to/test.jsonl".to_string(),
+            queued_at: Utc::now(),
+            status: JobStatus::Pending,
+            error: None,
+        };
+
+        queue.add(job.clone()).unwrap();
+
+        // Pop to mark as processing
+        let popped = queue.pop_pending().unwrap().unwrap();
+        assert_eq!(popped.status, JobStatus::Processing);
+
+        // Verify it's processing
+        let processing = queue.list_processing().unwrap();
+        assert_eq!(processing.len(), 1);
+
+        // Mark back to pending
+        queue.mark_pending("test-123").unwrap();
+
+        // Verify it's pending again
+        let pending = queue.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let processing = queue.list_processing().unwrap();
+        assert_eq!(processing.len(), 0);
     }
 }

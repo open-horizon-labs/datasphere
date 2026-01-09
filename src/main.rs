@@ -2,8 +2,8 @@ use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use datasphere::{
     chunk_text, discover_sessions, discover_sessions_in_dir, embed, extract_knowledge,
-    list_all_projects, read_transcript, AllProjectsWatcher, Job, JobStatus, Node, Processed,
-    Queue, SessionInfo, SourceType, Store,
+    list_all_projects, read_transcript, AllProjectsWatcher, Job, JobStatus, LlmError, Node,
+    Processed, Queue, SessionInfo, SourceType, Store,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -298,6 +298,59 @@ fn dir_size(path: &PathBuf) -> u64 {
 /// AIDEV-NOTE: 10 bits out of 64 (~15%) means meaningful content change
 const SIMHASH_CHANGE_THRESHOLD: u32 = 10;
 
+/// Error type for session processing
+#[derive(Debug)]
+enum ProcessError {
+    /// Rate limit hit - caller should back off
+    RateLimit(String),
+    /// Other errors
+    Other(String),
+}
+
+impl std::fmt::Display for ProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessError::RateLimit(msg) => write!(f, "Rate limit: {}", msg),
+            ProcessError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ProcessError {}
+
+impl From<LlmError> for ProcessError {
+    fn from(e: LlmError) -> Self {
+        match e {
+            LlmError::RateLimit(msg) => ProcessError::RateLimit(msg),
+            LlmError::Other(msg) => ProcessError::Other(msg),
+        }
+    }
+}
+
+impl From<String> for ProcessError {
+    fn from(e: String) -> Self {
+        ProcessError::Other(e)
+    }
+}
+
+impl From<lancedb::Error> for ProcessError {
+    fn from(e: lancedb::Error) -> Self {
+        ProcessError::Other(e.to_string())
+    }
+}
+
+impl From<datasphere::EmbedError> for ProcessError {
+    fn from(e: datasphere::EmbedError) -> Self {
+        ProcessError::Other(e.to_string())
+    }
+}
+
+impl From<datasphere::transcript::TranscriptError> for ProcessError {
+    fn from(e: datasphere::transcript::TranscriptError) -> Self {
+        ProcessError::Other(e.to_string())
+    }
+}
+
 /// Quick check if a transcript has any meaningful content (messages/summaries)
 /// Returns false for empty or content-free transcripts to avoid queueing them
 fn transcript_has_content(path: &std::path::Path) -> bool {
@@ -312,7 +365,7 @@ fn transcript_has_content(path: &std::path::Path) -> bool {
 async fn process_session(
     store: &Store,
     session: &SessionInfo,
-) -> Result<(usize, bool), Box<dyn std::error::Error>> {
+) -> Result<(usize, bool), ProcessError> {
     dlog!("  Reading transcript...");
 
     // Parse transcript
@@ -641,6 +694,11 @@ async fn run_scan(
 /// Delay between processing jobs (rate limiting)
 const JOB_DELAY_MS: u64 = 500;
 
+/// Rate limit backoff configuration
+/// Exponential backoff: 1min → 2min → 4min → 8min → 16min → 32min → 60min (capped)
+const RATE_LIMIT_INITIAL_BACKOFF_SECS: u64 = 60;
+const RATE_LIMIT_MAX_BACKOFF_SECS: u64 = 3600; // 1 hour cap
+
 /// Start daemon in background
 fn run_start_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // Check if already running
@@ -813,6 +871,10 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     let mut processed_count = 0;
     let mut total_nodes = 0;
 
+    // Rate limit backoff state (local to single-threaded daemon loop)
+    let mut rate_limit_backoff_secs: u64 = 0;
+    let mut rate_limit_until: Option<Instant> = None;
+
     dlog!("\nDaemon running (Ctrl+C to stop)...\n");
 
     // Set up signal handling for graceful shutdown
@@ -874,6 +936,20 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Check if we're in rate limit backoff
+        if let Some(until) = rate_limit_until {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                // Sleep for remaining time, capped at 1s for signal responsiveness
+                tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+                continue;
+            } else {
+                // Backoff period ended
+                dlog!("[RATE_LIMIT] Backoff period ended, resuming processing");
+                rate_limit_until = None;
+            }
+        }
+
         // Process one job from queue
         if let Ok(Some(job)) = queue.pop_pending() {
             dlog!(
@@ -894,12 +970,41 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
 
             match process_session(&store, &session).await {
                 Ok((nodes, was_skipped)) => {
+                    // Success - reset backoff on successful processing
+                    if rate_limit_backoff_secs > 0 {
+                        dlog!("[RATE_LIMIT] Success after backoff, resetting backoff state");
+                        rate_limit_backoff_secs = 0;
+                    }
+
                     if let Err(e) = queue.mark_done(&job.source_id) {
                         dlog!("  Failed to mark done: {}", e);
                     }
                     if !was_skipped {
                         processed_count += 1;
                         total_nodes += nodes;
+                    }
+                }
+                Err(ProcessError::RateLimit(msg)) => {
+                    // Rate limit hit - apply exponential backoff
+                    // Calculate next backoff duration
+                    rate_limit_backoff_secs = if rate_limit_backoff_secs == 0 {
+                        RATE_LIMIT_INITIAL_BACKOFF_SECS
+                    } else {
+                        (rate_limit_backoff_secs * 2).min(RATE_LIMIT_MAX_BACKOFF_SECS)
+                    };
+
+                    let backoff_duration = Duration::from_secs(rate_limit_backoff_secs);
+                    rate_limit_until = Some(Instant::now() + backoff_duration);
+
+                    dlog!(
+                        "[RATE_LIMIT] Hit rate limit: {}. Backing off for {} seconds",
+                        msg.lines().next().unwrap_or(&msg),
+                        rate_limit_backoff_secs
+                    );
+
+                    // Return job to pending state so it will be retried
+                    if let Err(e) = queue.mark_pending(&job.source_id) {
+                        dlog!("  Failed to return job to pending: {}", e);
                     }
                 }
                 Err(e) => {
@@ -910,8 +1015,10 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Rate limit
-            tokio::time::sleep(Duration::from_millis(JOB_DELAY_MS)).await;
+            // Rate limit between jobs (only if not in backoff)
+            if rate_limit_until.is_none() {
+                tokio::time::sleep(Duration::from_millis(JOB_DELAY_MS)).await;
+            }
         } else {
             // No pending jobs, sleep briefly before checking again
             tokio::time::sleep(Duration::from_millis(100)).await;
