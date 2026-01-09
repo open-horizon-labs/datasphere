@@ -95,7 +95,7 @@ pub struct ExtractionResult {
 ///
 /// # Returns
 /// ExtractionResult with insights (may be empty) and chunk count
-pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, String> {
+pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm::LlmError> {
     if transcript.trim().is_empty() {
         return Ok(ExtractionResult {
             insights: Vec::new(),
@@ -138,7 +138,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, Str
 
     // Distill chunks in parallel with bounded concurrency
     let chunk_start = Instant::now();
-    let chunk_results: Vec<(usize, Result<String, String>)> = stream::iter(chunks.into_iter().enumerate())
+    let chunk_results: Vec<(usize, Result<String, llm::LlmError>)> = stream::iter(chunks.into_iter().enumerate())
         .map(|(i, chunk)| async move {
             let result = call_extraction_llm(&chunk).await;
             (i, result)
@@ -149,6 +149,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, Str
     eprintln!("    Chunk distillation completed in {:.1}s", chunk_start.elapsed().as_secs_f32());
 
     // Collect successful distillations (preserving order for consistency)
+    // If any chunk hit a rate limit, propagate that error immediately
     let mut indexed_distillations: Vec<(usize, String)> = Vec::new();
     let mut dropped_count = 0;
 
@@ -162,6 +163,10 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, Str
                     dropped_count += 1;
                     eprintln!("    Chunk {} distillation too short ({} chars), skipping", i + 1, trimmed.len());
                 }
+            }
+            Err(llm::LlmError::RateLimit(msg)) => {
+                // Rate limit on any chunk should propagate immediately
+                return Err(llm::LlmError::RateLimit(msg));
             }
             Err(e) => {
                 dropped_count += 1;
@@ -195,7 +200,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, Str
 }
 
 /// Call LLM to extract knowledge from transcript
-async fn call_extraction_llm(transcript: &str) -> Result<String, String> {
+async fn call_extraction_llm(transcript: &str) -> Result<String, llm::LlmError> {
     // AIDEV-NOTE: Prompt based on engram-spec-v1.md extraction categories.
     // No structured format enforced - LLM narrates naturally.
     // The whole response becomes the node content.

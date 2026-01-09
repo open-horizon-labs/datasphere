@@ -8,6 +8,36 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::process::Command;
 
+/// Error types for LLM calls
+#[derive(Debug)]
+pub enum LlmError {
+    /// Rate limit hit - caller should back off
+    RateLimit(String),
+    /// Other errors
+    Other(String),
+}
+
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LlmError::RateLimit(msg) => write!(f, "Rate limit: {}", msg),
+            LlmError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for LlmError {}
+
+/// Check if an error message indicates a rate limit
+/// NOTE: Patterns may need updates as Claude CLI error messages evolve
+fn is_rate_limit_error(error_text: &str) -> bool {
+    let lower = error_text.to_lowercase();
+    lower.contains("hit your limit")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+}
+
 /// Cached path to claude CLI binary (resolved once at first use)
 static CLAUDE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
@@ -32,7 +62,11 @@ pub struct MarkerResponse {
 ///
 /// Returns the raw result string from the Claude CLI JSON response.
 /// Sets WM_DISABLED and SUPEREGO_DISABLED to prevent recursion.
-pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, String> {
+///
+/// # Errors
+/// - `LlmError::RateLimit` if the API rate limit was hit
+/// - `LlmError::Other` for all other errors
+pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, LlmError> {
     let mut cmd = Command::new(get_claude_path());
     cmd.arg("-p")
         .arg("--output-format")
@@ -51,30 +85,50 @@ pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, S
     let output = cmd
         .output()
         .await
-        .map_err(|e| format!("Failed to run claude CLI: {}", e))?;
+        .map_err(|e| LlmError::Other(format!("Failed to run claude CLI: {}", e)))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Try to parse JSON even on failure - Claude CLI may return is_error:true with valid JSON
+    if let Ok(cli_response) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        // Check for is_error flag in response
+        if cli_response.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let error_msg = cli_response
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+
+            if is_rate_limit_error(error_msg) {
+                return Err(LlmError::RateLimit(error_msg.to_string()));
+            }
+            return Err(LlmError::Other(error_msg.to_string()));
+        }
+
+        // Success case - extract result
+        if let Some(result) = cli_response.get("result").and_then(|v| v.as_str()) {
+            return Ok(result.to_string());
+        }
+
+        return Err(LlmError::Other("Claude CLI response missing 'result' field".to_string()));
+    }
+
+    // Couldn't parse JSON - check raw output for rate limit indicators
+    let combined = format!("{} {}", stdout, stderr);
+    if is_rate_limit_error(&combined) {
+        return Err(LlmError::RateLimit(combined));
+    }
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
+        return Err(LlmError::Other(format!(
             "Claude CLI failed (exit {:?}):\nstderr: {}\nstdout: {}",
             output.status.code(),
             stderr,
             stdout
-        ));
+        )));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Parse Claude CLI JSON wrapper to extract result field
-    let cli_response: serde_json::Value = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse Claude CLI response: {}", e))?;
-
-    cli_response
-        .get("result")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| "Claude CLI response missing 'result' field".to_string())
+    Err(LlmError::Other("Failed to parse Claude CLI response".to_string()))
 }
 
 /// Parse a marker-based response (e.g., "HAS_KNOWLEDGE: YES\n<content>")
@@ -150,5 +204,32 @@ mod tests {
         let result = parse_marker_response(text, "HAS_KNOWLEDGE");
         assert!(!result.is_positive);
         assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn test_is_rate_limit_error() {
+        // Common rate limit messages
+        assert!(is_rate_limit_error("You've hit your limit for today"));
+        assert!(is_rate_limit_error("Rate limit exceeded"));
+        assert!(is_rate_limit_error("Too many requests, please try again later"));
+        assert!(is_rate_limit_error("Error 429: Too many requests"));
+
+        // Case insensitive
+        assert!(is_rate_limit_error("HIT YOUR LIMIT"));
+        assert!(is_rate_limit_error("RATE LIMIT"));
+
+        // Not rate limit errors
+        assert!(!is_rate_limit_error("Connection failed"));
+        assert!(!is_rate_limit_error("Invalid API key"));
+        assert!(!is_rate_limit_error("Server error 500"));
+    }
+
+    #[test]
+    fn test_llm_error_display() {
+        let rate_limit = LlmError::RateLimit("hit your limit".to_string());
+        assert_eq!(format!("{}", rate_limit), "Rate limit: hit your limit");
+
+        let other = LlmError::Other("connection failed".to_string());
+        assert_eq!(format!("{}", other), "connection failed");
     }
 }
