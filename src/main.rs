@@ -103,10 +103,17 @@ enum QueueAction {
     Status,
     /// List pending jobs
     Pending,
+    /// List failed jobs
+    Failed,
     /// Clear completed jobs
     Clear,
     /// Delete entire queue (all jobs, all statuses)
     Nuke,
+    /// Retry failed jobs (requeue for processing)
+    Retry {
+        /// Specific job source_id to retry (retries all if omitted)
+        source_id: Option<String>,
+    },
 }
 
 /// Get the default database path
@@ -1066,6 +1073,23 @@ fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Erro
             }
         }
 
+        QueueAction::Failed => {
+            let jobs = queue.list_failed()?;
+            if jobs.is_empty() {
+                println!("No failed jobs.");
+            } else {
+                println!("Failed jobs ({}):", jobs.len());
+                for job in jobs {
+                    println!(
+                        "  {} ({}) - {}",
+                        &job.source_id[..8.min(job.source_id.len())],
+                        &job.project_id,
+                        job.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+            }
+        }
+
         QueueAction::Clear => {
             let cleared = queue.clear_done()?;
             println!("Cleared {} completed jobs.", cleared);
@@ -1074,6 +1098,26 @@ fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Erro
         QueueAction::Nuke => {
             let nuked = queue.nuke()?;
             println!("Nuked {} jobs.", nuked);
+        }
+
+        QueueAction::Retry { source_id } => {
+            match source_id {
+                Some(id) => {
+                    if queue.retry_one(&id)? {
+                        println!("Requeued job: {}", &id[..8.min(id.len())]);
+                    } else {
+                        println!("Job not found or not in failed state: {}", &id[..8.min(id.len())]);
+                    }
+                }
+                None => {
+                    let count = queue.retry_all()?;
+                    if count > 0 {
+                        println!("Requeued {} failed job(s).", count);
+                    } else {
+                        println!("No failed jobs to retry.");
+                    }
+                }
+            }
         }
     }
 

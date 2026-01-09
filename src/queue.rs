@@ -187,6 +187,54 @@ impl Queue {
         Ok(total)
     }
 
+    /// Retry all failed jobs (moves them from Failed → Pending)
+    /// Returns number of jobs requeued
+    pub fn retry_all(&self) -> Result<usize, String> {
+        let jobs = self.load_all()?;
+        let mut count = 0;
+
+        for (_, mut job) in jobs.into_iter() {
+            if job.status == JobStatus::Failed {
+                job.status = JobStatus::Pending;
+                job.error = None;
+                job.queued_at = Utc::now();
+                self.append(&job)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Retry a specific failed job by source_id
+    /// Returns Ok(true) if job was requeued, Ok(false) if not found or not failed
+    pub fn retry_one(&self, source_id: &str) -> Result<bool, String> {
+        let jobs = self.load_all()?;
+
+        if let Some(mut job) = jobs.get(source_id).cloned() {
+            if job.status == JobStatus::Failed {
+                job.status = JobStatus::Pending;
+                job.error = None;
+                job.queued_at = Utc::now();
+                self.append(&job)?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// List all failed jobs
+    pub fn list_failed(&self) -> Result<Vec<Job>, String> {
+        let jobs = self.load_all()?;
+        let mut failed: Vec<_> = jobs
+            .into_values()
+            .filter(|j| j.status == JobStatus::Failed)
+            .collect();
+        failed.sort_by(|a, b| a.queued_at.cmp(&b.queued_at));
+        Ok(failed)
+    }
+
     /// Load all jobs, deduplicating by source_id (latest wins)
     fn load_all(&self) -> Result<HashMap<String, Job>, String> {
         let mut jobs = HashMap::new();
@@ -347,5 +395,91 @@ mod tests {
         assert_eq!(pending.len(), 1);
         let processing = queue.list_processing().unwrap();
         assert_eq!(processing.len(), 0);
+    }
+
+    #[test]
+    fn test_retry_all() {
+        let (queue, _dir) = test_queue();
+
+        // Add two jobs and mark them as failed
+        let job1 = Job {
+            source_id: "test-1".to_string(),
+            source_type: "session".to_string(),
+            project_id: "-test-project".to_string(),
+            transcript_path: "/path/to/test1.jsonl".to_string(),
+            queued_at: Utc::now(),
+            status: JobStatus::Pending,
+            error: None,
+        };
+        let job2 = Job {
+            source_id: "test-2".to_string(),
+            source_type: "session".to_string(),
+            project_id: "-test-project".to_string(),
+            transcript_path: "/path/to/test2.jsonl".to_string(),
+            queued_at: Utc::now(),
+            status: JobStatus::Pending,
+            error: None,
+        };
+
+        queue.add(job1).unwrap();
+        queue.add(job2).unwrap();
+
+        // Mark both as failed
+        queue.mark_failed("test-1", "error 1").unwrap();
+        queue.mark_failed("test-2", "error 2").unwrap();
+
+        // Verify they're failed
+        let failed = queue.list_failed().unwrap();
+        assert_eq!(failed.len(), 2);
+        assert_eq!(queue.list_pending().unwrap().len(), 0);
+
+        // Retry all
+        let retried = queue.retry_all().unwrap();
+        assert_eq!(retried, 2);
+
+        // Verify they're now pending
+        let pending = queue.list_pending().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(queue.list_failed().unwrap().len(), 0);
+
+        // Error should be cleared
+        for job in &pending {
+            assert!(job.error.is_none());
+        }
+    }
+
+    #[test]
+    fn test_retry_one() {
+        let (queue, _dir) = test_queue();
+
+        let job = Job {
+            source_id: "test-123".to_string(),
+            source_type: "session".to_string(),
+            project_id: "-test-project".to_string(),
+            transcript_path: "/path/to/test.jsonl".to_string(),
+            queued_at: Utc::now(),
+            status: JobStatus::Pending,
+            error: None,
+        };
+
+        queue.add(job).unwrap();
+        queue.mark_failed("test-123", "some error").unwrap();
+
+        // Verify it's failed
+        assert_eq!(queue.list_failed().unwrap().len(), 1);
+        assert_eq!(queue.list_pending().unwrap().len(), 0);
+
+        // Retry non-existent job should return false
+        assert!(!queue.retry_one("nonexistent").unwrap());
+
+        // Retry the failed job
+        assert!(queue.retry_one("test-123").unwrap());
+
+        // Verify it's now pending
+        assert_eq!(queue.list_pending().unwrap().len(), 1);
+        assert_eq!(queue.list_failed().unwrap().len(), 0);
+
+        // Retrying again should return false (not failed anymore)
+        assert!(!queue.retry_one("test-123").unwrap());
     }
 }
