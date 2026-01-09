@@ -88,6 +88,9 @@ ds query "text"      # Search knowledge graph
 ds query -f json "x" # JSON output for MCP
 ds queue             # Show queue counts
 ds queue pending     # List pending jobs
+ds queue failed      # List failed jobs
+ds queue retry       # Requeue all failed jobs
+ds queue retry <id>  # Requeue specific failed job
 ds queue clear       # Remove completed jobs
 ds queue nuke        # Delete all jobs
 ds stats             # Database statistics
