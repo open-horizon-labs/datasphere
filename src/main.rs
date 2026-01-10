@@ -507,6 +507,11 @@ async fn process_session(
         dlog!("  Distilled in {:.1}s", distill_elapsed.as_secs_f32());
     }
 
+    // Log cost if available (from Anthropic API)
+    if let Some(cost) = extraction.total_cost {
+        dlog!("  [Cost] ${:.4}", cost);
+    }
+
     if extraction.insights.is_empty() {
         dlog!("  No substantive knowledge found");
         // Still record as processed

@@ -10,7 +10,7 @@ pub mod watch;
 
 pub use core::{Node, SourceType, EMBEDDING_DIM};
 pub use distill::{extract_knowledge, ExtractedInsight, ExtractionResult};
-pub use llm::LlmError;
+pub use llm::{LlmError, LlmResult};
 pub use embed::{chunk_text, embed, EmbedError};
 pub use queue::{Job, JobStatus, Queue};
 pub use session::{discover_sessions, discover_sessions_in_dir, list_all_projects, SessionInfo};

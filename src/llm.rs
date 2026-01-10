@@ -29,6 +29,15 @@ pub enum LlmError {
     Other(String),
 }
 
+/// Result of an LLM call with optional cost info
+#[derive(Debug)]
+pub struct LlmResult {
+    /// The generated text
+    pub text: String,
+    /// Cost info if available (input_tokens, output_tokens, cost_usd)
+    pub cost: Option<(u32, u32, f64)>,
+}
+
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -175,7 +184,7 @@ async fn call_anthropic(
     system_prompt: &str,
     message: &str,
     model: &str,
-) -> Result<String, LlmError> {
+) -> Result<LlmResult, LlmError> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| LlmError::Other("ANTHROPIC_API_KEY not set".to_string()))?;
 
@@ -221,21 +230,22 @@ async fn call_anthropic(
     let parsed: AnthropicResponse = serde_json::from_str(&body)
         .map_err(|e| LlmError::Other(format!("Failed to parse response: {} - {}", e, body)))?;
 
-    // Output cost
+    // Calculate cost
     let (input_price, output_price) = get_anthropic_pricing(resolved_model);
     let cost = (parsed.usage.input_tokens as f64 * input_price
         + parsed.usage.output_tokens as f64 * output_price)
         / 1_000_000.0;
-    eprintln!(
-        "    [Cost] {} in / {} out = ${:.4}",
-        parsed.usage.input_tokens, parsed.usage.output_tokens, cost
-    );
 
-    parsed
+    let text = parsed
         .content
         .first()
         .map(|c| c.text.clone())
-        .ok_or_else(|| LlmError::Other("No content in response".to_string()))
+        .ok_or_else(|| LlmError::Other("No content in response".to_string()))?;
+
+    Ok(LlmResult {
+        text,
+        cost: Some((parsed.usage.input_tokens, parsed.usage.output_tokens, cost)),
+    })
 }
 
 /// Call OpenAI chat completions API
@@ -243,7 +253,7 @@ async fn call_openai(
     system_prompt: &str,
     message: &str,
     model: &str,
-) -> Result<String, LlmError> {
+) -> Result<LlmResult, LlmError> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| LlmError::Other("OPENAI_API_KEY not set".to_string()))?;
 
@@ -294,11 +304,13 @@ async fn call_openai(
     let parsed: OpenAIChatResponse = serde_json::from_str(&body)
         .map_err(|e| LlmError::Other(format!("Failed to parse response: {} - {}", e, body)))?;
 
-    parsed
+    let text = parsed
         .choices
         .first()
         .map(|c| c.message.content.clone())
-        .ok_or_else(|| LlmError::Other("No choices in response".to_string()))
+        .ok_or_else(|| LlmError::Other("No choices in response".to_string()))?;
+
+    Ok(LlmResult { text, cost: None })
 }
 
 /// Call LLM with a system prompt and message (async)
@@ -308,10 +320,12 @@ async fn call_openai(
 /// 2. ANTHROPIC_API_KEY set → Anthropic API (preferred, avoids CLI session limits)
 /// 3. Fallback → Claude CLI
 ///
+/// Returns LlmResult with text and optional cost info (Anthropic API only).
+///
 /// # Errors
 /// - `LlmError::RateLimit` if the API rate limit was hit
 /// - `LlmError::Other` for all other errors
-pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, LlmError> {
+pub async fn call_claude(system_prompt: &str, message: &str) -> Result<LlmResult, LlmError> {
     let model = std::env::var("DATASPHERE_MODEL").unwrap_or_else(|_| "sonnet".to_string());
 
     // 1. OpenAI models → OpenAI API
@@ -324,7 +338,7 @@ pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, L
         return call_anthropic(system_prompt, message, &model).await;
     }
 
-    // 3. Fallback: Claude CLI
+    // 3. Fallback: Claude CLI (no cost info available)
     let mut cmd = Command::new(get_claude_path());
     cmd.arg("-p")
         .arg("--output-format")
@@ -367,7 +381,10 @@ pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, L
 
         // Success case - extract result
         if let Some(result) = cli_response.get("result").and_then(|v| v.as_str()) {
-            return Ok(result.to_string());
+            return Ok(LlmResult {
+                text: result.to_string(),
+                cost: None,
+            });
         }
 
         return Err(LlmError::Other("Claude CLI response missing 'result' field".to_string()));

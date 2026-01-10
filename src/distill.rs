@@ -80,6 +80,8 @@ pub struct ExtractionResult {
     /// All extracted insights (one per chunk, or single for small transcripts)
     pub insights: Vec<ExtractedInsight>,
     pub chunks_used: usize,
+    /// Total cost in USD (if available from API)
+    pub total_cost: Option<f64>,
 }
 
 /// Extract knowledge from a formatted transcript
@@ -100,6 +102,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
         return Ok(ExtractionResult {
             insights: Vec::new(),
             chunks_used: 0,
+            total_cost: None,
         });
     }
 
@@ -107,14 +110,16 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
 
     // Small transcript: single LLM call
     if token_count <= CHUNK_THRESHOLD_TOKENS {
-        let content = call_extraction_llm(transcript).await?;
-        let content = content.trim().to_string();
+        let result = call_extraction_llm(transcript).await?;
+        let cost = result.cost.map(|(_, _, usd)| usd);
+        let content = result.text.trim().to_string();
 
         if content.len() < MIN_CONTENT_LEN {
             eprintln!("    Distillation too short ({} chars < {}), skipping", content.len(), MIN_CONTENT_LEN);
             return Ok(ExtractionResult {
                 insights: Vec::new(),
                 chunks_used: 1,
+                total_cost: cost,
             });
         }
 
@@ -124,6 +129,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
                 confidence: 1.0,
             }],
             chunks_used: 1,
+            total_cost: cost,
         });
     }
 
@@ -138,7 +144,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
 
     // Distill chunks in parallel with bounded concurrency
     let chunk_start = Instant::now();
-    let chunk_results: Vec<(usize, Result<String, llm::LlmError>)> = stream::iter(chunks.into_iter().enumerate())
+    let chunk_results: Vec<(usize, Result<llm::LlmResult, llm::LlmError>)> = stream::iter(chunks.into_iter().enumerate())
         .map(|(i, chunk)| async move {
             let result = call_extraction_llm(&chunk).await;
             (i, result)
@@ -152,13 +158,17 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
     // If any chunk hit a rate limit, propagate that error immediately
     let mut indexed_distillations: Vec<(usize, String)> = Vec::new();
     let mut dropped_count = 0;
+    let mut total_cost: f64 = 0.0;
 
     for (i, result) in chunk_results {
         match result {
-            Ok(distillation) => {
-                let trimmed = distillation.trim();
+            Ok(llm_result) => {
+                if let Some((_, _, cost)) = llm_result.cost {
+                    total_cost += cost;
+                }
+                let trimmed = llm_result.text.trim();
                 if !trimmed.is_empty() && trimmed.len() >= MIN_CONTENT_LEN {
-                    indexed_distillations.push((i, distillation));
+                    indexed_distillations.push((i, llm_result.text));
                 } else {
                     dropped_count += 1;
                     eprintln!("    Chunk {} distillation too short ({} chars), skipping", i + 1, trimmed.len());
@@ -196,11 +206,12 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
     Ok(ExtractionResult {
         insights,
         chunks_used: chunk_count,
+        total_cost: if total_cost > 0.0 { Some(total_cost) } else { None },
     })
 }
 
 /// Call LLM to extract knowledge from transcript
-async fn call_extraction_llm(transcript: &str) -> Result<String, llm::LlmError> {
+async fn call_extraction_llm(transcript: &str) -> Result<llm::LlmResult, llm::LlmError> {
     // AIDEV-NOTE: Prompt based on engram-spec-v1.md extraction categories.
     // No structured format enforced - LLM narrates naturally.
     // The whole response becomes the node content.
