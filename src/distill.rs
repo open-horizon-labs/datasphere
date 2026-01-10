@@ -54,10 +54,10 @@ impl ExtractedInsight {
 /// Minimum length for a distillation to be considered substantive
 const MIN_CONTENT_LEN: usize = 50;
 
-/// Threshold for chunking (in tokens). Above this, we chunk and synthesize.
-/// AIDEV-NOTE: ~12K tokens leaves room for system prompt + response in Claude's context.
-/// Sessions above this threshold are also candidates for batch processing.
-pub const CHUNK_THRESHOLD_TOKENS: usize = 12000;
+/// Threshold for chunking (in tokens). Above this, we chunk and distill each chunk.
+/// AIDEV-NOTE: 50K tokens allows processing larger sessions before chunking.
+/// With 40K max chunk size, leaves room for system prompt + response.
+pub const CHUNK_THRESHOLD_TOKENS: usize = 50000;
 
 /// Processing mode for distillation
 /// AIDEV-NOTE: Batch mode saves 50% on API costs for large sessions
@@ -75,7 +75,8 @@ pub enum DistillMode {
 }
 
 /// Max tokens per chunk when splitting large transcripts
-const MAX_CHUNK_TOKENS: usize = 10000;
+/// AIDEV-NOTE: 40K tokens per chunk balances context richness with API limits
+const MAX_CHUNK_TOKENS: usize = 40000;
 
 /// Max parallel LLM calls for chunk distillation
 const PARALLEL_DISTILLATIONS: usize = 4;
@@ -135,9 +136,29 @@ fn count_tokens(text: &str) -> usize {
 }
 
 /// Split transcript into semantic chunks
-fn chunk_transcript(transcript: &str) -> Vec<String> {
+/// AIDEV-NOTE: Exported for incremental chunk processing (compare simhashes before distilling)
+pub fn chunk_transcript(transcript: &str) -> Vec<String> {
     let chunker = Chunker::new(MAX_CHUNK_TOKENS, Box::new(count_tokens));
     chunker.chunk(transcript)
+}
+
+/// Distill a single chunk via LLM
+/// AIDEV-NOTE: Used for incremental processing when only some chunks have changed
+pub async fn distill_chunk(
+    chunk: &str,
+    cancel_token: &CancellationToken,
+) -> Result<Option<ExtractedInsight>, llm::LlmError> {
+    let result = call_extraction_llm(chunk, cancel_token).await?;
+    let content = result.text.trim().to_string();
+
+    if content.len() < MIN_CONTENT_LEN {
+        return Ok(None);
+    }
+
+    Ok(Some(ExtractedInsight {
+        content,
+        confidence: 1.0,
+    }))
 }
 
 /// Result of extraction with metadata about chunking

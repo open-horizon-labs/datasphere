@@ -1,13 +1,13 @@
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use datasphere::{
-    chunk_text, discover_sessions, discover_sessions_in_dir, embed, extract_knowledge,
-    list_all_projects, read_transcript, AllProjectsWatcher, BatchQueue, DistillMode, EmbedError,
-    Job, JobStatus, LlmError, Node, Processed, Queue, SessionInfo, SourceType, Store,
+    chunk_text, chunk_transcript, discover_sessions, discover_sessions_in_dir, distill_chunk,
+    embed, list_all_projects, read_transcript, AllProjectsWatcher, BatchQueue, EmbedError, Job,
+    JobStatus, LlmError, Node, Processed, Queue, SessionInfo, SourceType, Store,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -447,13 +447,14 @@ enum ProcessResult {
     QueuedForBatch,
 }
 
-/// Process a single session transcript
+/// Process a single session transcript with incremental chunk processing
+/// AIDEV-NOTE: Compares per-chunk simhashes to only re-distill changed chunks.
 /// Returns ProcessResult indicating what happened
 async fn process_session(
     store: &Store,
     session: &SessionInfo,
     cancel_token: &CancellationToken,
-    batch_queue: Option<Arc<Mutex<BatchQueue>>>,
+    _batch_queue: Option<Arc<Mutex<BatchQueue>>>,
 ) -> Result<ProcessResult, ProcessError> {
     dlog!("  Reading transcript...");
 
@@ -499,11 +500,13 @@ async fn process_session(
 
     dlog!("  Context size: {} chars", context.len());
 
-    // Compute SimHash of context
+    // Compute overall SimHash of context for quick change detection
     let current_simhash = simhash::simhash(&context) as i64;
 
-    // Check if already processed
-    if let Some(existing) = store.get_processed(&session.session_id).await? {
+    // Check if session was previously processed
+    let existing_processed = store.get_processed(&session.session_id).await?;
+
+    if let Some(ref existing) = existing_processed {
         let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
 
         if hamming <= SIMHASH_CHANGE_THRESHOLD {
@@ -515,98 +518,155 @@ async fn process_session(
         }
 
         dlog!(
-            "  Session changed (simhash distance: {} bits), re-distilling...",
+            "  Session changed (simhash distance: {} bits), checking chunks...",
             hamming
         );
+    }
 
-        // Delete old nodes, then processed record
-        let node_ids: Vec<Uuid> = existing.node_ids
-            .iter()
-            .filter_map(|id| id.parse::<Uuid>().ok())
-            .collect();
-        if !node_ids.is_empty() {
-            store.delete_nodes(&node_ids).await?;
-            dlog!("  Deleted {} old node(s)", node_ids.len());
+    // Chunk the transcript and compute per-chunk simhashes
+    let chunks = chunk_transcript(&context);
+    let chunk_simhashes: Vec<i64> = chunks
+        .iter()
+        .map(|chunk| simhash::simhash(chunk) as i64)
+        .collect();
+
+    dlog!("  Split into {} chunk(s)", chunks.len());
+
+    // Get existing nodes for this session (for incremental comparison)
+    let existing_nodes = store.get_nodes_by_source(&session.session_id).await?;
+
+    // Build map of existing chunk simhashes -> node IDs
+    // AIDEV-NOTE: Chunks are matched by simhash, not by index (boundaries may shift)
+    let mut existing_by_simhash: HashMap<i64, Vec<Uuid>> = HashMap::new();
+    for node in &existing_nodes {
+        if let Some(chunk_simhash) = node.chunk_simhash {
+            existing_by_simhash
+                .entry(chunk_simhash)
+                .or_default()
+                .push(node.id);
         }
+    }
+
+    // Determine which chunks need distillation (new or changed)
+    let mut chunks_to_distill: Vec<(usize, &str, i64)> = Vec::new();
+    let mut kept_node_ids: HashSet<Uuid> = HashSet::new();
+    let mut new_chunk_simhashes: HashSet<i64> = HashSet::new();
+
+    for (i, (chunk, &chunk_simhash)) in chunks.iter().zip(chunk_simhashes.iter()).enumerate() {
+        new_chunk_simhashes.insert(chunk_simhash);
+
+        if let Some(node_ids) = existing_by_simhash.get(&chunk_simhash) {
+            // Chunk unchanged - keep existing node(s)
+            // AIDEV-NOTE: Take first matching node (in case of duplicates)
+            if let Some(&node_id) = node_ids.first() {
+                kept_node_ids.insert(node_id);
+                dlog!("    Chunk {} unchanged (simhash {:016x})", i + 1, chunk_simhash as u64);
+            }
+        } else {
+            // New or changed chunk - needs distillation
+            chunks_to_distill.push((i, chunk, chunk_simhash));
+        }
+    }
+
+    // Delete orphaned nodes (chunks that no longer exist)
+    let mut deleted_count = 0;
+    for node in &existing_nodes {
+        if !kept_node_ids.contains(&node.id) {
+            store.delete_node(node.id).await?;
+            deleted_count += 1;
+        }
+    }
+    if deleted_count > 0 {
+        dlog!("  Deleted {} orphaned node(s)", deleted_count);
+    }
+
+    // Delete old processed record if it exists (will re-create with updated info)
+    if existing_processed.is_some() {
         store.delete_processed(&session.session_id).await?;
     }
 
-    // Distill knowledge via LLM
-    // AIDEV-NOTE: Use batch mode for large sessions (>12K tokens) to save 50% on API costs
-    let mode = match &batch_queue {
-        Some(queue) => DistillMode::Batch {
-            queue: Arc::clone(queue),
-            session_id: session.session_id.clone(),
-            simhash: current_simhash,
-        },
-        None => DistillMode::RealTime,
-    };
+    if chunks_to_distill.is_empty() {
+        dlog!("  All chunks unchanged, keeping {} existing node(s)", kept_node_ids.len());
 
-    dlog!("  Distilling via LLM...");
-    let distill_start = Instant::now();
-    let extraction = match extract_knowledge(&context, cancel_token, &mode).await {
-        Ok(result) => result,
-        Err(e) => {
-            dlog!("  LLM extraction failed: {}", e);
-            return Err(e.into());
-        }
-    };
-    let distill_elapsed = distill_start.elapsed();
-
-    // If queued for batch, return early - batch processing will handle embedding/storage
-    if extraction.queued_for_batch {
-        dlog!("  Queued for batch processing (will complete later)");
-        return Ok(ProcessResult::QueuedForBatch);
-    }
-
-    // Log chunking info if used
-    if extraction.chunks_used > 1 {
-        dlog!("  Distilled {} chunks in {:.1}s", extraction.chunks_used, distill_elapsed.as_secs_f32());
-    } else {
-        dlog!("  Distilled in {:.1}s", distill_elapsed.as_secs_f32());
-    }
-
-    // Log cost if available (from Anthropic API)
-    if let Some((input, output, cost)) = extraction.total_cost {
-        dlog!("  [Cost] {} in / {} out = ${:.4}", input, output, cost);
-    }
-
-    if extraction.insights.is_empty() {
-        dlog!("  No substantive knowledge found");
-        // Still record as processed
+        // Re-record as processed with current simhash
+        let node_ids: Vec<String> = kept_node_ids.iter().map(|id| id.to_string()).collect();
         let record = Processed {
             source_id: session.session_id.clone(),
             source_type: "session".to_string(),
             simhash: current_simhash,
             processed_at: Utc::now(),
-            node_count: 0,
-            node_ids: Vec::new(),
+            node_count: node_ids.len() as i32,
+            node_ids,
         };
         store.insert_processed(&record).await?;
-        return Ok(ProcessResult::Processed(0));
+
+        return Ok(ProcessResult::Processed(0)); // 0 new nodes created
     }
 
-    dlog!("  Extracted {} insight(s)", extraction.insights.len());
+    dlog!(
+        "  Distilling {} changed chunk(s), keeping {} unchanged...",
+        chunks_to_distill.len(),
+        kept_node_ids.len()
+    );
 
-    // Embed and store each insight as a separate node
-    let total_insights = extraction.insights.len();
-    let mut node_ids = Vec::new();
-    for (i, insight) in extraction.insights.into_iter().enumerate() {
-        let embed_start = Instant::now();
-        let embedding = embed(&insight.content, cancel_token).await?;
-        dlog!("  Embedded {}/{} in {:.1}s", i + 1, total_insights, embed_start.elapsed().as_secs_f32());
+    // Distill changed chunks
+    let distill_start = Instant::now();
+    let mut new_node_ids: Vec<String> = Vec::new();
+    let total_to_distill = chunks_to_distill.len();
 
-        let node = insight.into_node(
-            session.session_id.clone(),
-            SourceType::Session,
-            embedding,
-        );
-        let node_id = node.id.to_string();
+    for (processed, (chunk_idx, chunk, chunk_simhash)) in chunks_to_distill.into_iter().enumerate() {
+        // Distill the chunk
+        match distill_chunk(chunk, cancel_token).await {
+            Ok(Some(insight)) => {
+                // Embed and store
+                let embed_start = Instant::now();
+                let embedding = embed(&insight.content, cancel_token).await?;
+                dlog!(
+                    "    Chunk {} distilled + embedded in {:.1}s ({}/{})",
+                    chunk_idx + 1,
+                    embed_start.elapsed().as_secs_f32(),
+                    processed + 1,
+                    total_to_distill
+                );
 
-        store.insert_node(&node).await?;
-
-        node_ids.push(node_id);
+                let node = Node::with_chunk(
+                    insight.content,
+                    session.session_id.clone(),
+                    SourceType::Session,
+                    embedding,
+                    insight.confidence,
+                    "personal".to_string(),
+                    chunk_simhash,
+                    chunk_idx as i32,
+                );
+                let node_id = node.id.to_string();
+                store.insert_node(&node).await?;
+                new_node_ids.push(node_id);
+            }
+            Ok(None) => {
+                dlog!("    Chunk {} distillation too short, skipping", chunk_idx + 1);
+            }
+            Err(LlmError::RateLimit(msg)) => {
+                return Err(ProcessError::RateLimit(msg));
+            }
+            Err(LlmError::Cancelled) => {
+                return Err(ProcessError::Cancelled);
+            }
+            Err(e) => {
+                dlog!("    Chunk {} distillation failed: {}", chunk_idx + 1, e);
+                // Continue with other chunks
+            }
+        }
     }
+
+    dlog!("  Distillation completed in {:.1}s", distill_start.elapsed().as_secs_f32());
+
+    // Combine kept and new node IDs
+    let all_node_ids: Vec<String> = kept_node_ids
+        .iter()
+        .map(|id| id.to_string())
+        .chain(new_node_ids.iter().cloned())
+        .collect();
 
     // Record as processed
     let record = Processed {
@@ -614,13 +674,18 @@ async fn process_session(
         source_type: "session".to_string(),
         simhash: current_simhash,
         processed_at: Utc::now(),
-        node_count: node_ids.len() as i32,
-        node_ids,
+        node_count: all_node_ids.len() as i32,
+        node_ids: all_node_ids,
     };
     store.insert_processed(&record).await?;
 
-    dlog!("  Done! Created {} node(s)", record.node_count);
-    Ok(ProcessResult::Processed(record.node_count as usize))
+    dlog!(
+        "  Done! {} new node(s), {} kept, {} total",
+        new_node_ids.len(),
+        kept_node_ids.len(),
+        record.node_count
+    );
+    Ok(ProcessResult::Processed(new_node_ids.len()))
 }
 
 /// Process completed batch results
@@ -680,6 +745,8 @@ async fn process_batch_results(
                             let embedding = embed(trimmed, cancel_token).await?;
 
                             // Create and store node
+                            // AIDEV-NOTE: Batch processing creates nodes without chunk metadata
+                            // because the whole transcript is distilled as one unit
                             let node = Node::new(
                                 trimmed.to_string(),
                                 session_id.clone(),

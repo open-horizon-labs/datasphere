@@ -21,6 +21,9 @@ pub fn nodes_schema() -> Arc<Schema> {
         Field::new("confidence", DataType::Float32, false),
         Field::new("metadata", DataType::Utf8, true),
         Field::new("namespace", DataType::Utf8, false), // e.g., "personal", "team:xyz"
+        // AIDEV-NOTE: chunk_simhash and chunk_index added for incremental chunk processing
+        Field::new("chunk_simhash", DataType::Int64, true), // SimHash of source chunk content
+        Field::new("chunk_index", DataType::Int32, true),   // Index of chunk within source (0-based)
     ]))
 }
 
