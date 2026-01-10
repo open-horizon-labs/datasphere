@@ -135,11 +135,29 @@ struct AnthropicMessage<'a> {
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
+    usage: AnthropicUsage,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicContent {
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+/// Get Anthropic pricing per million tokens (input, output)
+/// From: https://platform.claude.com/docs/en/about-claude/models/overview
+fn get_anthropic_pricing(model: &str) -> (f64, f64) {
+    match model {
+        "claude-haiku-4-5" => (1.00, 5.00),   // $1/$5 per MTok
+        "claude-sonnet-4-5" => (3.00, 15.00), // $3/$15 per MTok
+        "claude-opus-4-5" => (5.00, 25.00),   // $5/$25 per MTok
+        _ => (3.00, 15.00), // Default to sonnet pricing
+    }
 }
 
 /// Map short model names to full Anthropic model IDs
@@ -202,6 +220,16 @@ async fn call_anthropic(
 
     let parsed: AnthropicResponse = serde_json::from_str(&body)
         .map_err(|e| LlmError::Other(format!("Failed to parse response: {} - {}", e, body)))?;
+
+    // Output cost
+    let (input_price, output_price) = get_anthropic_pricing(resolved_model);
+    let cost = (parsed.usage.input_tokens as f64 * input_price
+        + parsed.usage.output_tokens as f64 * output_price)
+        / 1_000_000.0;
+    eprintln!(
+        "    [Cost] {} in / {} out = ${:.4}",
+        parsed.usage.input_tokens, parsed.usage.output_tokens, cost
+    );
 
     parsed
         .content
