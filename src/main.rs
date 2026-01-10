@@ -5,7 +5,8 @@ use datasphere::{
     list_all_projects, read_transcript, AllProjectsWatcher, BatchQueue, DistillMode, EmbedError,
     Job, JobStatus, LlmError, Node, Processed, Queue, SessionInfo, SourceType, Store,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -630,8 +631,9 @@ async fn process_batch_results(
     cancel_token: &CancellationToken,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // Poll for completed batches
+    // AIDEV-NOTE: Using tokio::sync::Mutex to safely hold lock across await
     let completed = {
-        let mut bq = batch_queue.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let mut bq = batch_queue.lock().await;
         bq.poll_pending().await.map_err(|e| format!("Poll error: {}", e))?
     };
 
@@ -647,7 +649,7 @@ async fn process_batch_results(
         // Get request metadata (session_id, simhash) for this batch
         // AIDEV-NOTE: simhash is critical for deduplication - prevents re-queue on restart
         let request_meta = {
-            let bq = batch_queue.lock().map_err(|e| format!("Lock error: {}", e))?;
+            let bq = batch_queue.lock().await;
             bq.get_request_meta(&batch)
         };
 
@@ -1137,7 +1139,8 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     )));
 
     // Load any pending batches from previous run
-    if let Ok(mut bq) = batch_queue.lock() {
+    {
+        let mut bq = batch_queue.lock().await;
         if let Err(e) = bq.load_state() {
             dlog!("Warning: failed to load batch state: {}", e);
         }
@@ -1432,16 +1435,17 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
 
             // Check if we should submit a batch
             let should_submit = {
-                let bq = batch_queue.lock().map_err(|e| format!("Lock error: {}", e))?;
+                let bq = batch_queue.lock().await;
                 bq.should_submit()
             };
 
             if should_submit {
                 dlog!("[BATCH] Submitting queued requests...");
-                match {
-                    let mut bq = batch_queue.lock().map_err(|e| format!("Lock error: {}", e))?;
+                let submit_result = {
+                    let mut bq = batch_queue.lock().await;
                     bq.submit().await
-                } {
+                };
+                match submit_result {
                     Ok(batch_id) => {
                         dlog!("[BATCH] Submitted batch: {}", &batch_id[..8.min(batch_id.len())]);
                     }
@@ -1469,7 +1473,8 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(daemon_pid_path());
 
     // Save batch state before shutdown
-    if let Ok(bq) = batch_queue.lock() {
+    {
+        let bq = batch_queue.lock().await;
         if let Err(e) = bq.save_state() {
             dlog!("Warning: failed to save batch state: {}", e);
         }

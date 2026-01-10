@@ -23,7 +23,8 @@ use crate::core::{Node, SourceType};
 use crate::llm;
 use futures::{stream, StreamExt};
 use semchunk_rs::Chunker;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Mutex;
 use std::time::Instant;
 use tiktoken_rs::{cl100k_base, CoreBPE};
 use tokio_util::sync::CancellationToken;
@@ -217,7 +218,8 @@ pub async fn extract_knowledge(
         eprintln!("    Large session ({} tokens), queueing for batch processing", token_count);
 
         // Queue the whole transcript for batch processing
-        if let Ok(mut q) = queue.lock() {
+        {
+            let mut q = queue.lock().await;
             q.add(
                 session_id.clone(),
                 EXTRACTION_SYSTEM_PROMPT.to_string(),
