@@ -20,13 +20,21 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show database statistics
-    Stats,
+    Stats {
+        /// Custom database path (defaults to ~/.datasphere/db)
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 
     /// Show stored nodes
     Show {
         /// Maximum number of nodes to show
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Custom database path (defaults to ~/.datasphere/db)
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
 
     /// Scan and distill transcripts (one-shot)
@@ -81,6 +89,10 @@ enum Commands {
         /// Filter by namespace (omit to search all namespaces)
         #[arg(short, long)]
         namespace: Option<String>,
+
+        /// Custom database path (defaults to ~/.datasphere/db)
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
 
     /// Delete everything (database + queue) and start fresh
@@ -112,6 +124,10 @@ enum Commands {
         /// Output format (text or json)
         #[arg(short, long, default_value = "text")]
         format: String,
+
+        /// Custom database path (defaults to ~/.datasphere/db)
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
 }
 
@@ -140,6 +156,11 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".datasphere")
         .join("db")
+}
+
+/// Resolve database path from optional override or default
+fn resolve_db_path(db_override: Option<PathBuf>) -> PathBuf {
+    db_override.unwrap_or_else(default_db_path)
 }
 
 /// Get the daemon PID file path
@@ -1201,8 +1222,9 @@ async fn run_query(
     limit: usize,
     format: &str,
     namespace_filter: Option<&str>,
+    db_override: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = default_db_path();
+    let db_path = resolve_db_path(db_override);
 
     if !db_path.exists() {
         eprintln!("Database not found at: {}", db_path.display());
@@ -1274,8 +1296,9 @@ async fn run_related(
     node_id: &str,
     limit: usize,
     format: &str,
+    db_override: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = default_db_path();
+    let db_path = resolve_db_path(db_override);
 
     if !db_path.exists() {
         eprintln!("Database not found at: {}", db_path.display());
@@ -1348,8 +1371,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Stats => {
-            let db_path = default_db_path();
+        Commands::Stats { db } => {
+            let db_path = resolve_db_path(db);
 
             if !db_path.exists() {
                 println!("Database not found at: {}", db_path.display());
@@ -1372,8 +1395,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Processed:  {} transcripts", processed);
         }
 
-        Commands::Show { limit } => {
-            let db_path = default_db_path();
+        Commands::Show { limit, db } => {
+            let db_path = resolve_db_path(db);
 
             if !db_path.exists() {
                 println!("Database not found at: {}", db_path.display());
@@ -1466,12 +1489,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Query { query, limit, format, namespace } => {
-            run_query(&query, limit, &format, namespace.as_deref()).await?;
+        Commands::Query { query, limit, format, namespace, db } => {
+            run_query(&query, limit, &format, namespace.as_deref(), db).await?;
         }
 
-        Commands::Related { node_id, limit, format } => {
-            run_related(&node_id, limit, &format).await?;
+        Commands::Related { node_id, limit, format, db } => {
+            run_related(&node_id, limit, &format, db).await?;
         }
 
         Commands::Reset => {

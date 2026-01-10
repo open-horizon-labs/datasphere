@@ -1,12 +1,24 @@
-//! LLM utilities for calling Claude CLI
+//! LLM utilities for calling Claude CLI, Anthropic API, or OpenAI API
 //!
-//! AIDEV-NOTE: Adapted from wm/src/llm.rs. Engram uses same pattern:
-//! call Claude CLI with a system prompt, parse response using text markers.
+//! AIDEV-NOTE: Adapted from wm/src/llm.rs. Supports multiple providers:
+//! - Anthropic API (preferred): direct HTTP calls when ANTHROPIC_API_KEY is set
+//! - Claude CLI (fallback): uses `claude` binary with system prompt
+//! - OpenAI API: direct HTTP calls to chat completions endpoint
+//!
+//! Set DATASPHERE_MODEL to control model:
+//! - "haiku", "sonnet", "opus" → Anthropic API (if key set) or Claude CLI
+//! - "gpt-4o", "gpt-4.5-preview", "o1", etc. → OpenAI API
 
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::process::Command;
+
+const OPENAI_CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
+const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 /// Error types for LLM calls
 #[derive(Debug)]
@@ -58,15 +70,233 @@ pub struct MarkerResponse {
     pub content: String,
 }
 
-/// Call Claude CLI with a system prompt and message (async)
+// OpenAI API types
+#[derive(Debug, Serialize)]
+struct OpenAIChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<OpenAIMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+}
+
+/// Check if model uses new-style max_completion_tokens param
+fn uses_completion_tokens(model: &str) -> bool {
+    model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAIMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIChatResponse {
+    choices: Vec<OpenAIChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIChoice {
+    message: OpenAIResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponseMessage {
+    content: String,
+}
+
+/// Check if model name indicates OpenAI
+fn is_openai_model(model: &str) -> bool {
+    model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("chatgpt")
+}
+
+// Anthropic API types
+#[derive(Debug, Serialize)]
+struct AnthropicRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    system: &'a str,
+    messages: Vec<AnthropicMessage<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicResponse {
+    content: Vec<AnthropicContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContent {
+    text: String,
+}
+
+/// Map short model names to full Anthropic model IDs
+fn resolve_anthropic_model(model: &str) -> &str {
+    match model {
+        "haiku" => "claude-haiku-4-5",
+        "sonnet" => "claude-sonnet-4-5",
+        "opus" => "claude-opus-4-5",
+        _ => model, // Pass through full model IDs
+    }
+}
+
+/// Call Anthropic Messages API directly
+async fn call_anthropic(
+    system_prompt: &str,
+    message: &str,
+    model: &str,
+) -> Result<String, LlmError> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| LlmError::Other("ANTHROPIC_API_KEY not set".to_string()))?;
+
+    let resolved_model = resolve_anthropic_model(model);
+    let client = Client::new();
+    let request = AnthropicRequest {
+        model: resolved_model,
+        max_tokens: 16000,
+        system: system_prompt,
+        messages: vec![AnthropicMessage {
+            role: "user",
+            content: message,
+        }],
+    };
+
+    let response = client
+        .post(ANTHROPIC_API_URL)
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", ANTHROPIC_API_VERSION)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| LlmError::Other(format!("Anthropic request failed: {}", e)))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| LlmError::Other(format!("Failed to read response: {}", e)))?;
+
+    if status == 429 {
+        return Err(LlmError::RateLimit(body));
+    }
+
+    if !status.is_success() {
+        return Err(LlmError::Other(format!(
+            "Anthropic API error ({}): {}",
+            status, body
+        )));
+    }
+
+    let parsed: AnthropicResponse = serde_json::from_str(&body)
+        .map_err(|e| LlmError::Other(format!("Failed to parse response: {} - {}", e, body)))?;
+
+    parsed
+        .content
+        .first()
+        .map(|c| c.text.clone())
+        .ok_or_else(|| LlmError::Other("No content in response".to_string()))
+}
+
+/// Call OpenAI chat completions API
+async fn call_openai(
+    system_prompt: &str,
+    message: &str,
+    model: &str,
+) -> Result<String, LlmError> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| LlmError::Other("OPENAI_API_KEY not set".to_string()))?;
+
+    let client = Client::new();
+    let use_completion_tokens = uses_completion_tokens(model);
+    let request = OpenAIChatRequest {
+        model,
+        messages: vec![
+            OpenAIMessage {
+                role: "system",
+                content: system_prompt,
+            },
+            OpenAIMessage {
+                role: "user",
+                content: message,
+            },
+        ],
+        max_tokens: if use_completion_tokens { None } else { Some(16000) },
+        max_completion_tokens: if use_completion_tokens { Some(16000) } else { None },
+    };
+
+    let response = client
+        .post(OPENAI_CHAT_URL)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| LlmError::Other(format!("OpenAI request failed: {}", e)))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| LlmError::Other(format!("Failed to read response: {}", e)))?;
+
+    if status == 429 {
+        return Err(LlmError::RateLimit(body));
+    }
+
+    if !status.is_success() {
+        return Err(LlmError::Other(format!(
+            "OpenAI API error ({}): {}",
+            status, body
+        )));
+    }
+
+    let parsed: OpenAIChatResponse = serde_json::from_str(&body)
+        .map_err(|e| LlmError::Other(format!("Failed to parse response: {} - {}", e, body)))?;
+
+    parsed
+        .choices
+        .first()
+        .map(|c| c.message.content.clone())
+        .ok_or_else(|| LlmError::Other("No choices in response".to_string()))
+}
+
+/// Call LLM with a system prompt and message (async)
 ///
-/// Returns the raw result string from the Claude CLI JSON response.
-/// Sets WM_DISABLED and SUPEREGO_DISABLED to prevent recursion.
+/// Provider selection priority:
+/// 1. OpenAI models (gpt-*, o1, o3) → OpenAI API
+/// 2. ANTHROPIC_API_KEY set → Anthropic API (preferred, avoids CLI session limits)
+/// 3. Fallback → Claude CLI
 ///
 /// # Errors
 /// - `LlmError::RateLimit` if the API rate limit was hit
 /// - `LlmError::Other` for all other errors
 pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, LlmError> {
+    let model = std::env::var("DATASPHERE_MODEL").unwrap_or_else(|_| "sonnet".to_string());
+
+    // 1. OpenAI models → OpenAI API
+    if is_openai_model(&model) {
+        return call_openai(system_prompt, message, &model).await;
+    }
+
+    // 2. ANTHROPIC_API_KEY set → Anthropic API (preferred)
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        return call_anthropic(system_prompt, message, &model).await;
+    }
+
+    // 3. Fallback: Claude CLI
     let mut cmd = Command::new(get_claude_path());
     cmd.arg("-p")
         .arg("--output-format")
@@ -80,7 +310,9 @@ pub async fn call_claude(system_prompt: &str, message: &str) -> Result<String, L
         .stdin(Stdio::null())
         .env("WM_DISABLED", "1")
         .env("SUPEREGO_DISABLED", "1")
-        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "16000");
+        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "16000")
+        .arg("--model")
+        .arg(&model);
 
     let output = cmd
         .output()
