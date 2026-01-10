@@ -25,6 +25,12 @@ pub struct Node {
     pub confidence: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+}
+
+fn default_namespace() -> String {
+    "personal".to_string()
 }
 
 impl Node {
@@ -34,6 +40,17 @@ impl Node {
         source_type: SourceType,
         embedding: Vec<f32>,
         confidence: f32,
+    ) -> Self {
+        Self::with_namespace(content, source, source_type, embedding, confidence, "personal".to_string())
+    }
+
+    pub fn with_namespace(
+        content: String,
+        source: String,
+        source_type: SourceType,
+        embedding: Vec<f32>,
+        confidence: f32,
+        namespace: String,
     ) -> Self {
         debug_assert!(
             embedding.len() == EMBEDDING_DIM,
@@ -50,6 +67,7 @@ impl Node {
             embedding,
             confidence,
             metadata: None,
+            namespace,
         }
     }
 }

@@ -20,6 +20,7 @@ pub fn nodes_schema() -> Arc<Schema> {
         ),
         Field::new("confidence", DataType::Float32, false),
         Field::new("metadata", DataType::Utf8, true),
+        Field::new("namespace", DataType::Utf8, false), // e.g., "personal", "team:xyz"
     ]))
 }
 

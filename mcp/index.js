@@ -51,6 +51,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'number',
             description: 'Maximum number of results (default: 5)',
             default: 5
+          },
+          namespace: {
+            type: 'string',
+            description: 'Filter by namespace (e.g., "personal", "team:xyz"). Omit to search all namespaces.'
           }
         },
         required: ['query']
@@ -74,6 +78,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ['node_id']
       }
+    },
+    {
+      name: 'datasphere_add',
+      description: 'Add a note to the datasphere knowledge graph. Use this to remember insights, decisions, patterns, or learnings from conversations. Structure the content clearly for future semantic search retrieval.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: {
+            type: 'string',
+            description: 'The note content to add to the knowledge graph'
+          },
+          source: {
+            type: 'string',
+            description: 'Category tag for the note (e.g., "note", "decision", "pattern", "insight")',
+            default: 'note'
+          },
+          namespace: {
+            type: 'string',
+            description: 'Namespace for the note (default: "personal")',
+            default: 'personal'
+          }
+        },
+        required: ['content']
+      }
     }
   ]
 }));
@@ -83,11 +111,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   if (name === 'datasphere_query') {
-    const { query, limit = 5 } = args;
+    const { query, limit = 5, namespace } = args;
 
     try {
+      const namespaceFlag = namespace ? `--namespace ${JSON.stringify(namespace)}` : '';
       const result = execSync(
-        `ds query --format json --limit ${limit} ${JSON.stringify(query)}`,
+        `ds query --format json --limit ${limit} ${namespaceFlag} ${JSON.stringify(query)}`,
         { encoding: 'utf-8', timeout: 30000 }
       );
 
@@ -158,6 +187,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const message = error instanceof Error ? error.message : 'Unknown error';
       return {
         content: [{ type: 'text', text: `Error finding related nodes: ${message}` }],
+        isError: true
+      };
+    }
+  }
+
+  if (name === 'datasphere_add') {
+    const { content, source = 'note', namespace = 'personal' } = args;
+
+    try {
+      const result = execSync(
+        `ds note ${JSON.stringify(content)} --source ${source} --namespace ${namespace}`,
+        { encoding: 'utf-8', timeout: 60000 }
+      );
+
+      // Extract node ID from output (format: "  ID: <uuid>")
+      const idMatch = result.match(/ID:\s+([a-f0-9-]+)/i);
+      const nodeId = idMatch ? idMatch[1] : null;
+
+      return {
+        content: [{
+          type: 'text',
+          text: nodeId
+            ? `Added to datasphere (ID: ${nodeId})`
+            : 'Added to datasphere'
+        }]
+      };
+
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        content: [{ type: 'text', text: `Error adding to datasphere: ${message}` }],
         isError: true
       };
     }

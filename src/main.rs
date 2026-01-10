@@ -77,10 +77,28 @@ enum Commands {
         /// Output format (text or json)
         #[arg(short, long, default_value = "text")]
         format: String,
+
+        /// Filter by namespace (omit to search all namespaces)
+        #[arg(short, long)]
+        namespace: Option<String>,
     },
 
     /// Delete everything (database + queue) and start fresh
     Reset,
+
+    /// Add a note directly to the knowledge graph
+    Note {
+        /// The note content
+        content: String,
+
+        /// Source tag (default: "note")
+        #[arg(short, long, default_value = "note")]
+        source: String,
+
+        /// Namespace for the note (default: "personal")
+        #[arg(short, long, default_value = "personal")]
+        namespace: String,
+    },
 
     /// Find nodes similar to a given node
     Related {
@@ -615,6 +633,59 @@ async fn process_file(
     Ok(record.node_count as usize)
 }
 
+/// Process a note (direct text input, no LLM distillation)
+/// Returns the node IDs created
+async fn process_note(
+    store: &Store,
+    content: &str,
+    source_tag: &str,
+    namespace: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let timestamp = Utc::now();
+    let source_id = format!("{}:{}", source_tag, timestamp.to_rfc3339());
+
+    println!("Adding note...");
+    println!("  Source: {}", source_id);
+    println!("  Namespace: {}", namespace);
+    println!("  Content: {} chars", content.len());
+
+    if content.trim().is_empty() {
+        return Err("Note content is empty".into());
+    }
+
+    // Chunk content if needed
+    let chunks = chunk_text(content);
+    println!("  Chunks: {}", chunks.len());
+
+    // Embed each chunk and create nodes
+    let mut node_ids = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let embed_start = Instant::now();
+        let embedding = embed(chunk).await?;
+        println!(
+            "  Embedded {}/{} in {:.1}s",
+            i + 1,
+            chunks.len(),
+            embed_start.elapsed().as_secs_f32()
+        );
+
+        let node = Node::with_namespace(
+            chunk.clone(),
+            source_id.clone(),
+            SourceType::File, // Notes use File type (no session association)
+            embedding,
+            1.0, // Full confidence for direct input
+            namespace.to_string(),
+        );
+        let node_id = node.id.to_string();
+        store.insert_node(&node).await?;
+        node_ids.push(node_id);
+    }
+
+    println!("  Created {} node(s)", node_ids.len());
+    Ok(node_ids)
+}
+
 /// Run scan command - one-shot distillation
 async fn run_scan(
     project: Option<PathBuf>,
@@ -1129,6 +1200,7 @@ async fn run_query(
     query: &str,
     limit: usize,
     format: &str,
+    namespace_filter: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = default_db_path();
 
@@ -1142,8 +1214,20 @@ async fn run_query(
     // Embed the query
     let embedding = embed(query).await?;
 
-    // Search for similar nodes
-    let results = store.search_similar_with_scores(&embedding, limit).await?;
+    // Search for similar nodes (fetch more if filtering)
+    let fetch_limit = if namespace_filter.is_some() { limit * 3 } else { limit };
+    let results = store.search_similar_with_scores(&embedding, fetch_limit).await?;
+
+    // Filter by namespace if specified
+    let results: Vec<_> = if let Some(ns) = namespace_filter {
+        results
+            .into_iter()
+            .filter(|(node, _)| node.namespace == ns)
+            .take(limit)
+            .collect()
+    } else {
+        results.into_iter().take(limit).collect()
+    };
 
     if results.is_empty() {
         if format == "json" {
@@ -1163,6 +1247,7 @@ async fn run_query(
                     "id": node.id.to_string(),
                     "content": node.content,
                     "source": node.source,
+                    "namespace": node.namespace,
                     "similarity": score,
                     "timestamp": node.timestamp.to_rfc3339(),
                 })
@@ -1173,8 +1258,9 @@ async fn run_query(
         // Human-readable text output
         for (i, (node, score)) in results.iter().enumerate() {
             println!("─── Result {} (similarity: {:.2}) ───", i + 1, score);
-            println!("Source: {}", node.source);
-            println!("Time:   {}", node.timestamp.format("%Y-%m-%d %H:%M"));
+            println!("Source:    {}", node.source);
+            println!("Namespace: {}", node.namespace);
+            println!("Time:      {}", node.timestamp.format("%Y-%m-%d %H:%M"));
             println!("{}", node.content);
             println!();
         }
@@ -1304,9 +1390,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for (i, node) in nodes.iter().enumerate() {
                 println!("─── Node {} ───", i + 1);
-                println!("ID:      {}", node.id);
-                println!("Source:  {}", node.source);
-                println!("Time:    {}", node.timestamp.format("%Y-%m-%d %H:%M"));
+                println!("ID:        {}", node.id);
+                println!("Source:    {}", node.source);
+                println!("Namespace: {}", node.namespace);
+                println!("Time:      {}", node.timestamp.format("%Y-%m-%d %H:%M"));
                 println!("Content:\n{}", node.content);
                 println!();
             }
@@ -1360,8 +1447,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Query { query, limit, format } => {
-            run_query(&query, limit, &format).await?;
+        Commands::Note { content, source, namespace } => {
+            let db_path = default_db_path();
+            let store = Store::open(db_path.to_str().unwrap()).await?;
+
+            println!("ds note");
+            println!("==========");
+
+            match process_note(&store, &content, &source, &namespace).await {
+                Ok(node_ids) => {
+                    for id in &node_ids {
+                        println!("  ID: {}", id);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                }
+            }
+        }
+
+        Commands::Query { query, limit, format, namespace } => {
+            run_query(&query, limit, &format, namespace.as_deref()).await?;
         }
 
         Commands::Related { node_id, limit, format } => {

@@ -4,7 +4,7 @@ use arrow_array::{
 };
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
-use lancedb::{connect, Connection, Table, query::{QueryBase, ExecutableQuery}, DistanceType};
+use lancedb::{connect, Connection, Table, query::{QueryBase, ExecutableQuery}, DistanceType, table::NewColumnTransform};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -44,6 +44,23 @@ impl Store {
                     .await?
             }
         };
+
+        // AIDEV-NOTE: Migration - add namespace column if missing (v0.1.4+)
+        // Check schema and add namespace column for existing databases
+        let schema = nodes.schema().await?;
+        let has_namespace = schema.fields().iter().any(|f| f.name() == "namespace");
+        if !has_namespace {
+            eprintln!("Migrating nodes table: adding namespace column...");
+            nodes
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![
+                        ("namespace".to_string(), "'personal'".to_string()),
+                    ]),
+                    None,
+                )
+                .await?;
+            eprintln!("Migration complete: all existing nodes assigned to 'personal' namespace");
+        }
 
         // Open or create processed table
         let processed = match db.open_table("processed").execute().await {
@@ -234,6 +251,7 @@ fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {
         .metadata
         .as_ref()
         .map(|m| m.to_string())]);
+    let namespaces = StringArray::from(vec![node.namespace.as_str()]);
 
     let batch = RecordBatch::try_new(
         nodes_schema(),
@@ -246,6 +264,7 @@ fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {
             Arc::new(embeddings),
             Arc::new(confidences),
             Arc::new(metadata),
+            Arc::new(namespaces),
         ],
     )
     .map_err(|e| lancedb::Error::Arrow { source: e })?;
@@ -318,6 +337,11 @@ fn batch_to_nodes(batch: &RecordBatch) -> Result<Vec<Node>, lancedb::Error> {
             message: "metadata column not found".to_string(),
         })?;
 
+    // namespace column (added in v0.1.4, may not exist in older queries)
+    let namespace_col = batch
+        .column_by_name("namespace")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
     let mut nodes = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         let embedding_array = embeddings.value(i);
@@ -337,6 +361,10 @@ fn batch_to_nodes(batch: &RecordBatch) -> Result<Vec<Node>, lancedb::Error> {
                 .parse::<serde_json::Value>()
                 .ok()
         };
+
+        let namespace = namespace_col
+            .map(|col| col.value(i).to_string())
+            .unwrap_or_else(|| "personal".to_string());
 
         let node = Node {
             id: ids
@@ -360,6 +388,7 @@ fn batch_to_nodes(batch: &RecordBatch) -> Result<Vec<Node>, lancedb::Error> {
             embedding,
             confidence: confidences.value(i),
             metadata,
+            namespace,
         };
         nodes.push(node);
     }
