@@ -68,6 +68,8 @@ pub enum DistillMode {
     Batch {
         queue: Arc<Mutex<BatchQueue>>,
         session_id: String,
+        /// SimHash of the transcript (preserved for deduplication on completion)
+        simhash: i64,
     },
 }
 
@@ -211,7 +213,7 @@ pub async fn extract_knowledge(
     }
 
     // Large transcript: check if we should batch
-    if let DistillMode::Batch { queue, session_id } = mode {
+    if let DistillMode::Batch { queue, session_id, simhash } = mode {
         eprintln!("    Large session ({} tokens), queueing for batch processing", token_count);
 
         // Queue the whole transcript for batch processing
@@ -220,6 +222,7 @@ pub async fn extract_knowledge(
                 session_id.clone(),
                 EXTRACTION_SYSTEM_PROMPT.to_string(),
                 format!("TRANSCRIPT:\n{}", transcript),
+                *simhash,
             );
         }
 

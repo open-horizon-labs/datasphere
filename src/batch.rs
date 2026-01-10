@@ -73,6 +73,19 @@ pub struct BatchRequest {
     pub message: String,
     /// When this request was queued
     pub queued_at: DateTime<Utc>,
+    /// SimHash of the transcript content (for deduplication on completion)
+    pub simhash: i64,
+}
+
+/// Metadata for a batch request (preserved through submit → poll cycle)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRequestMeta {
+    /// Custom ID for matching results
+    pub custom_id: String,
+    /// Session ID this request belongs to
+    pub session_id: String,
+    /// SimHash of the transcript content
+    pub simhash: i64,
 }
 
 /// A batch that has been submitted and is pending completion
@@ -86,6 +99,9 @@ pub struct PendingBatch {
     pub request_ids: Vec<String>,
     /// Model used for this batch
     pub model: String,
+    /// Request metadata (session_id, simhash) preserved for result processing
+    #[serde(default)]
+    pub request_meta: Vec<BatchRequestMeta>,
 }
 
 /// Status of a batch
@@ -288,7 +304,7 @@ impl BatchQueue {
     }
 
     /// Add a request to the queue
-    pub fn add(&mut self, session_id: String, system_prompt: String, message: String) {
+    pub fn add(&mut self, session_id: String, system_prompt: String, message: String, simhash: i64) {
         let custom_id = format!("{}:{}", session_id, Utc::now().timestamp());
         self.requests.push(BatchRequest {
             custom_id,
@@ -296,6 +312,7 @@ impl BatchQueue {
             system_prompt,
             message,
             queued_at: Utc::now(),
+            simhash,
         });
     }
 
@@ -407,12 +424,23 @@ impl BatchQueue {
 
         let batch_id = parsed.id.clone();
 
+        // Build metadata from submitted requests (preserves simhash through batch lifecycle)
+        let request_meta: Vec<BatchRequestMeta> = to_submit
+            .iter()
+            .map(|r| BatchRequestMeta {
+                custom_id: r.custom_id.clone(),
+                session_id: r.session_id.clone(),
+                simhash: r.simhash,
+            })
+            .collect();
+
         // Track pending batch
         self.pending_batches.push(PendingBatch {
             batch_id: batch_id.clone(),
             submitted_at: Utc::now(),
             request_ids,
             model: self.model.clone(),
+            request_meta,
         });
 
         // Save state
@@ -543,13 +571,32 @@ impl BatchQueue {
 
     /// Get mapping of custom_id to session_id for a batch
     pub fn get_session_mapping(&self, batch: &PendingBatch) -> HashMap<String, String> {
-        // Parse custom_id format: "session_id:timestamp"
+        // First try to use request_meta (preserves exact session_id)
+        if !batch.request_meta.is_empty() {
+            return batch
+                .request_meta
+                .iter()
+                .map(|m| (m.custom_id.clone(), m.session_id.clone()))
+                .collect();
+        }
+
+        // Fallback: parse custom_id format "session_id:timestamp"
         batch
             .request_ids
             .iter()
             .filter_map(|cid| {
                 cid.split(':').next().map(|sid| (cid.clone(), sid.to_string()))
             })
+            .collect()
+    }
+
+    /// Get mapping of custom_id to (session_id, simhash) for a batch
+    /// AIDEV-NOTE: Critical for deduplication - simhash must be stored with processed record
+    pub fn get_request_meta(&self, batch: &PendingBatch) -> HashMap<String, (String, i64)> {
+        batch
+            .request_meta
+            .iter()
+            .map(|m| (m.custom_id.clone(), (m.session_id.clone(), m.simhash)))
             .collect()
     }
 }
@@ -568,7 +615,7 @@ mod tests {
     fn test_should_submit_count_threshold() {
         let mut queue = BatchQueue::new("test".to_string(), PathBuf::from("/tmp/test"));
         for i in 0..BATCH_MIN_COUNT {
-            queue.add(format!("sess_{}", i), "system".to_string(), "message".to_string());
+            queue.add(format!("sess_{}", i), "system".to_string(), "message".to_string(), i as i64);
         }
         assert!(queue.should_submit());
     }

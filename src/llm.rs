@@ -273,14 +273,13 @@ async fn call_anthropic(
         .map_err(|e| LlmError::Other(format!("Failed to parse response: {} - {}", e, body)))?;
 
     // Calculate cost with cache pricing
-    // - Regular input tokens: base price
-    // - Cache read tokens: 10% of base price (90% discount)
-    // - Cache write tokens: 125% of base price (25% premium)
+    // AIDEV-NOTE: Anthropic's usage fields are:
+    //   - input_tokens: NON-cached input tokens (billed at base price)
+    //   - cache_read_input_tokens: tokens read from cache (10% of base price)
+    //   - cache_creation_input_tokens: tokens written to cache (125% of base price)
+    //   Total input = input_tokens + cache_read + cache_creation
     let (input_price, output_price) = get_anthropic_pricing(resolved_model);
-    let regular_input = parsed.usage.input_tokens.saturating_sub(
-        parsed.usage.cache_read_input_tokens + parsed.usage.cache_creation_input_tokens,
-    );
-    let cost = (regular_input as f64 * input_price
+    let cost = (parsed.usage.input_tokens as f64 * input_price
         + parsed.usage.cache_read_input_tokens as f64 * input_price * 0.1
         + parsed.usage.cache_creation_input_tokens as f64 * input_price * 1.25
         + parsed.usage.output_tokens as f64 * output_price)

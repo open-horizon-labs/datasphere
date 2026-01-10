@@ -536,6 +536,7 @@ async fn process_session(
         Some(queue) => DistillMode::Batch {
             queue: Arc::clone(queue),
             session_id: session.session_id.clone(),
+            simhash: current_simhash,
         },
         None => DistillMode::RealTime,
     };
@@ -643,18 +644,23 @@ async fn process_batch_results(
     for (batch, results) in completed {
         dlog!("[BATCH] Processing completed batch {} ({} results)", &batch.batch_id[..8.min(batch.batch_id.len())], results.len());
 
-        // Get session mapping for this batch
-        let session_mapping = {
+        // Get request metadata (session_id, simhash) for this batch
+        // AIDEV-NOTE: simhash is critical for deduplication - prevents re-queue on restart
+        let request_meta = {
             let bq = batch_queue.lock().map_err(|e| format!("Lock error: {}", e))?;
-            bq.get_session_mapping(&batch)
+            bq.get_request_meta(&batch)
         };
 
         for result in results {
-            // Extract session_id from custom_id
-            let session_id = session_mapping
+            // Extract session_id and simhash from metadata
+            let (session_id, simhash) = request_meta
                 .get(&result.custom_id)
                 .cloned()
-                .unwrap_or_else(|| result.custom_id.split(':').next().unwrap_or(&result.custom_id).to_string());
+                .unwrap_or_else(|| {
+                    // Fallback: parse custom_id, use 0 for simhash (will re-process on change)
+                    let sid = result.custom_id.split(':').next().unwrap_or(&result.custom_id).to_string();
+                    (sid, 0)
+                });
 
             match result.result_type.as_str() {
                 "succeeded" => {
@@ -675,11 +681,11 @@ async fn process_batch_results(
                             let node_id = node.id.to_string();
                             store.insert_node(&node).await?;
 
-                            // Record as processed
+                            // Record as processed with original simhash
                             let record = Processed {
                                 source_id: session_id.clone(),
                                 source_type: "session".to_string(),
-                                simhash: 0, // No simhash for batch results
+                                simhash,
                                 processed_at: Utc::now(),
                                 node_count: 1,
                                 node_ids: vec![node_id],
@@ -1114,11 +1120,11 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize batch queue for large sessions (50% cost savings)
     // AIDEV-NOTE: Sessions >12K tokens are queued for batch API processing
-    // Use same model as real-time processing (DATASPHERE_MODEL env var, defaults to opus)
+    // Model IDs must match llm.rs resolve_model() for consistent pricing/behavior
     let batch_model = match std::env::var("DATASPHERE_MODEL").unwrap_or_else(|_| "opus".to_string()).as_str() {
         "opus" => "claude-opus-4-5",
-        "sonnet" => "claude-sonnet-4-20250514",
-        "haiku" => "claude-3-5-haiku-20241022",
+        "sonnet" => "claude-sonnet-4-5",
+        "haiku" => "claude-haiku-4-5",
         other => other, // Use model name directly if not a shorthand
     }.to_string();
     let batch_state_path = dirs::home_dir()
