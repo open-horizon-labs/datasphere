@@ -214,23 +214,35 @@ pub async fn extract_knowledge(
     }
 
     // Large transcript: check if we should batch
+    // AIDEV-NOTE: Chunk before queueing to ensure consistent node granularity
     if let DistillMode::Batch { queue, session_id, simhash } = mode {
-        eprintln!("    Large session ({} tokens), queueing for batch processing", token_count);
+        // Chunk the transcript (same as real-time path)
+        let chunks = chunk_transcript(transcript);
+        let total_chunks = chunks.len();
 
-        // Queue the whole transcript for batch processing
+        eprintln!(
+            "    Large session ({} tokens, {} chunks), queueing for batch processing",
+            token_count, total_chunks
+        );
+
+        // Queue each chunk as a separate batch request
         {
             let mut q = queue.lock().await;
-            q.add(
-                session_id.clone(),
-                EXTRACTION_SYSTEM_PROMPT.to_string(),
-                format!("TRANSCRIPT:\n{}", transcript),
-                *simhash,
-            );
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                q.add_chunk(
+                    session_id.clone(),
+                    EXTRACTION_SYSTEM_PROMPT.to_string(),
+                    format!("TRANSCRIPT CHUNK {}/{}:\n{}", i + 1, total_chunks, chunk),
+                    *simhash,
+                    Some(i),
+                    Some(total_chunks),
+                );
+            }
         }
 
         return Ok(ExtractionResult {
             insights: Vec::new(),
-            chunks_used: 0,
+            chunks_used: total_chunks,
             total_cost: None,
             queued_for_batch: true,
         });

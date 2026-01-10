@@ -625,11 +625,14 @@ async fn process_session(
 
 /// Process completed batch results
 /// AIDEV-NOTE: Batch results contain distilled text that needs to be embedded and stored
+/// For chunked sessions, results are aggregated into multiple nodes per session
 async fn process_batch_results(
     store: &Store,
     batch_queue: &Arc<Mutex<BatchQueue>>,
     cancel_token: &CancellationToken,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+
     // Poll for completed batches
     // AIDEV-NOTE: Using tokio::sync::Mutex to safely hold lock across await
     let completed = {
@@ -646,23 +649,27 @@ async fn process_batch_results(
     for (batch, results) in completed {
         dlog!("[BATCH] Processing completed batch {} ({} results)", &batch.batch_id[..8.min(batch.batch_id.len())], results.len());
 
-        // Get request metadata (session_id, simhash) for this batch
-        // AIDEV-NOTE: simhash is critical for deduplication - prevents re-queue on restart
+        // Get request metadata for this batch
         let request_meta = {
             let bq = batch_queue.lock().await;
             bq.get_request_meta(&batch)
         };
 
+        // Group results by session_id for chunk aggregation
+        // AIDEV-NOTE: Multiple chunks from same session become multiple nodes, one Processed record
+        let mut session_results: HashMap<String, Vec<(String, i64, Option<usize>)>> = HashMap::new();
+
         for result in results {
-            // Extract session_id and simhash from metadata
-            let (session_id, simhash) = request_meta
-                .get(&result.custom_id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    // Fallback: parse custom_id, use 0 for simhash (will re-process on change)
+            // Get metadata for this result
+            let meta = request_meta.get(&result.custom_id);
+            let (session_id, simhash, chunk_index) = match meta {
+                Some(m) => (m.session_id.clone(), m.simhash, m.chunk_index),
+                None => {
+                    // Fallback: parse custom_id
                     let sid = result.custom_id.split(':').next().unwrap_or(&result.custom_id).to_string();
-                    (sid, 0)
-                });
+                    (sid, 0, None)
+                }
+            };
 
             match result.result_type.as_str() {
                 "succeeded" => {
@@ -683,18 +690,14 @@ async fn process_batch_results(
                             let node_id = node.id.to_string();
                             store.insert_node(&node).await?;
 
-                            // Record as processed with original simhash
-                            let record = Processed {
-                                source_id: session_id.clone(),
-                                source_type: "session".to_string(),
-                                simhash,
-                                processed_at: Utc::now(),
-                                node_count: 1,
-                                node_ids: vec![node_id],
-                            };
-                            store.insert_processed(&record).await?;
+                            // Track this node for the session
+                            session_results
+                                .entry(session_id.clone())
+                                .or_default()
+                                .push((node_id, simhash, chunk_index));
 
-                            dlog!("    {} -> created node", &session_id[..8.min(session_id.len())]);
+                            let chunk_info = chunk_index.map(|i| format!(" chunk {}", i)).unwrap_or_default();
+                            dlog!("    {}{} -> created node", &session_id[..8.min(session_id.len())], chunk_info);
                             total_nodes += 1;
                         } else {
                             dlog!("    {} -> distillation too short ({} chars)", &session_id[..8.min(session_id.len())], trimmed.len());
@@ -714,6 +717,29 @@ async fn process_batch_results(
             if let Some(usage) = result.usage {
                 dlog!("    [Cost] {} in / {} out", usage.input_tokens, usage.output_tokens);
             }
+        }
+
+        // Create Processed records for each session (aggregating all chunks)
+        for (session_id, nodes_info) in session_results {
+            if nodes_info.is_empty() {
+                continue;
+            }
+
+            // Use simhash from first chunk (all chunks have same session simhash)
+            let simhash = nodes_info[0].1;
+            let node_ids: Vec<String> = nodes_info.into_iter().map(|(id, _, _)| id).collect();
+            let node_count = node_ids.len() as i32;
+
+            let record = Processed {
+                source_id: session_id.clone(),
+                source_type: "session".to_string(),
+                simhash,
+                processed_at: Utc::now(),
+                node_count,
+                node_ids,
+            };
+            store.insert_processed(&record).await?;
+            dlog!("    {} -> recorded {} node(s)", &session_id[..8.min(session_id.len())], node_count);
         }
     }
 

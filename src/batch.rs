@@ -63,7 +63,7 @@ impl std::error::Error for BatchError {}
 /// A single request to be included in a batch
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchRequest {
-    /// Unique identifier for matching results (typically session_id)
+    /// Unique identifier for matching results (session_id:chunk:timestamp)
     pub custom_id: String,
     /// Session ID this request belongs to
     pub session_id: String,
@@ -75,6 +75,12 @@ pub struct BatchRequest {
     pub queued_at: DateTime<Utc>,
     /// SimHash of the transcript content (for deduplication on completion)
     pub simhash: i64,
+    /// Chunk index (0-based) if this is part of a chunked session
+    #[serde(default)]
+    pub chunk_index: Option<usize>,
+    /// Total number of chunks for this session
+    #[serde(default)]
+    pub total_chunks: Option<usize>,
 }
 
 /// Metadata for a batch request (preserved through submit → poll cycle)
@@ -86,6 +92,12 @@ pub struct BatchRequestMeta {
     pub session_id: String,
     /// SimHash of the transcript content
     pub simhash: i64,
+    /// Chunk index (0-based) if this is part of a chunked session
+    #[serde(default)]
+    pub chunk_index: Option<usize>,
+    /// Total number of chunks for this session
+    #[serde(default)]
+    pub total_chunks: Option<usize>,
 }
 
 /// A batch that has been submitted and is pending completion
@@ -304,8 +316,27 @@ impl BatchQueue {
     }
 
     /// Add a request to the queue
+    /// For unchunked sessions, chunk_index and total_chunks should be None
     pub fn add(&mut self, session_id: String, system_prompt: String, message: String, simhash: i64) {
-        let custom_id = format!("{}:{}", session_id, Utc::now().timestamp());
+        self.add_chunk(session_id, system_prompt, message, simhash, None, None);
+    }
+
+    /// Add a chunked request to the queue
+    /// AIDEV-NOTE: Each chunk gets its own batch request, results aggregated on completion
+    pub fn add_chunk(
+        &mut self,
+        session_id: String,
+        system_prompt: String,
+        message: String,
+        simhash: i64,
+        chunk_index: Option<usize>,
+        total_chunks: Option<usize>,
+    ) {
+        let timestamp = Utc::now().timestamp();
+        let custom_id = match chunk_index {
+            Some(idx) => format!("{}:c{}:{}", session_id, idx, timestamp),
+            None => format!("{}:{}", session_id, timestamp),
+        };
         self.requests.push(BatchRequest {
             custom_id,
             session_id,
@@ -313,6 +344,8 @@ impl BatchQueue {
             message,
             queued_at: Utc::now(),
             simhash,
+            chunk_index,
+            total_chunks,
         });
     }
 
@@ -424,13 +457,15 @@ impl BatchQueue {
 
         let batch_id = parsed.id.clone();
 
-        // Build metadata from submitted requests (preserves simhash through batch lifecycle)
+        // Build metadata from submitted requests (preserves simhash + chunk info through batch lifecycle)
         let request_meta: Vec<BatchRequestMeta> = to_submit
             .iter()
             .map(|r| BatchRequestMeta {
                 custom_id: r.custom_id.clone(),
                 session_id: r.session_id.clone(),
                 simhash: r.simhash,
+                chunk_index: r.chunk_index,
+                total_chunks: r.total_chunks,
             })
             .collect();
 
@@ -590,13 +625,14 @@ impl BatchQueue {
             .collect()
     }
 
-    /// Get mapping of custom_id to (session_id, simhash) for a batch
-    /// AIDEV-NOTE: Critical for deduplication - simhash must be stored with processed record
-    pub fn get_request_meta(&self, batch: &PendingBatch) -> HashMap<String, (String, i64)> {
+    /// Get full metadata for a batch (for result processing)
+    /// Returns mapping of custom_id to BatchRequestMeta
+    /// AIDEV-NOTE: Critical for deduplication and chunk aggregation
+    pub fn get_request_meta(&self, batch: &PendingBatch) -> HashMap<String, BatchRequestMeta> {
         batch
             .request_meta
             .iter()
-            .map(|m| (m.custom_id.clone(), (m.session_id.clone(), m.simhash)))
+            .map(|m| (m.custom_id.clone(), m.clone()))
             .collect()
     }
 }
