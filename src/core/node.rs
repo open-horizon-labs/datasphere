@@ -27,6 +27,14 @@ pub struct Node {
     pub metadata: Option<serde_json::Value>,
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    /// SimHash of the source chunk content (for incremental re-processing)
+    /// AIDEV-NOTE: Used to detect unchanged chunks and skip re-distillation
+    #[serde(default)]
+    pub chunk_simhash: Option<i64>,
+    /// Index of the chunk within the source (0-based)
+    /// AIDEV-NOTE: Used to match chunks across re-processing runs
+    #[serde(default)]
+    pub chunk_index: Option<i32>,
 }
 
 fn default_namespace() -> String {
@@ -68,6 +76,40 @@ impl Node {
             confidence,
             metadata: None,
             namespace,
+            chunk_simhash: None,
+            chunk_index: None,
+        }
+    }
+
+    /// Create a node with chunk metadata for incremental processing
+    pub fn with_chunk(
+        content: String,
+        source: String,
+        source_type: SourceType,
+        embedding: Vec<f32>,
+        confidence: f32,
+        namespace: String,
+        chunk_simhash: i64,
+        chunk_index: i32,
+    ) -> Self {
+        debug_assert!(
+            embedding.len() == EMBEDDING_DIM,
+            "expected {} dims, got {}",
+            EMBEDDING_DIM,
+            embedding.len()
+        );
+        Self {
+            id: Uuid::new_v4(),
+            content,
+            source,
+            source_type,
+            timestamp: Utc::now(),
+            embedding,
+            confidence,
+            metadata: None,
+            namespace,
+            chunk_simhash: Some(chunk_simhash),
+            chunk_index: Some(chunk_index),
         }
     }
 }
