@@ -12,6 +12,7 @@ use semchunk_rs::Chunker;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tiktoken_rs::{cl100k_base, CoreBPE};
+use tokio_util::sync::CancellationToken;
 
 const OPENAI_EMBEDDINGS_URL: &str = "https://api.openai.com/v1/embeddings";
 const MODEL: &str = "text-embedding-3-small";
@@ -42,8 +43,8 @@ struct EmbeddingData {
 /// and averages the embeddings.
 ///
 /// # Errors
-/// Returns error if OPENAI_API_KEY not set or API call fails
-pub async fn embed(text: &str) -> Result<Vec<f32>, EmbedError> {
+/// Returns error if OPENAI_API_KEY not set, API call fails, or cancelled
+pub async fn embed(text: &str, cancel_token: &CancellationToken) -> Result<Vec<f32>, EmbedError> {
     let api_key =
         std::env::var("OPENAI_API_KEY").map_err(|_| EmbedError::MissingApiKey)?;
 
@@ -57,13 +58,13 @@ pub async fn embed(text: &str) -> Result<Vec<f32>, EmbedError> {
 
     // Single chunk - simple case
     if chunks.len() == 1 {
-        return call_openai(&client, &api_key, &chunks[0]).await;
+        return call_openai(&client, &api_key, &chunks[0], cancel_token).await;
     }
 
     // Multiple chunks - embed each and average
     let mut embeddings = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
-        let emb = call_openai(&client, &api_key, chunk).await?;
+        let emb = call_openai(&client, &api_key, chunk, cancel_token).await?;
         embeddings.push(emb);
     }
 
@@ -75,19 +76,27 @@ async fn call_openai(
     client: &Client,
     api_key: &str,
     text: &str,
+    cancel_token: &CancellationToken,
 ) -> Result<Vec<f32>, EmbedError> {
     let request = EmbeddingRequest {
         model: MODEL,
         input: text,
     };
 
-    let response = client
-        .post(OPENAI_EMBEDDINGS_URL)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| EmbedError::ApiError(e.to_string()))?;
+    // Race the HTTP request against cancellation
+    let response = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            return Err(EmbedError::Cancelled);
+        }
+        result = client
+            .post(OPENAI_EMBEDDINGS_URL)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&request)
+            .send() => {
+            result.map_err(|e| EmbedError::ApiError(e.to_string()))?
+        }
+    };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -166,6 +175,8 @@ pub enum EmbedError {
     MissingApiKey,
     EmptyInput,
     ApiError(String),
+    /// Request was cancelled (e.g., daemon shutdown)
+    Cancelled,
 }
 
 impl std::fmt::Display for EmbedError {
@@ -174,6 +185,7 @@ impl std::fmt::Display for EmbedError {
             EmbedError::MissingApiKey => write!(f, "OPENAI_API_KEY not set"),
             EmbedError::EmptyInput => write!(f, "Empty input text"),
             EmbedError::ApiError(e) => write!(f, "OpenAI API error: {}", e),
+            EmbedError::Cancelled => write!(f, "Request cancelled"),
         }
     }
 }
