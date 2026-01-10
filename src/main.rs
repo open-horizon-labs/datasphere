@@ -848,15 +848,22 @@ fn run_stop() -> Result<(), Box<dyn std::error::Error>> {
                 // Send SIGTERM
                 let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                 if result == 0 {
-                    println!("Stopping daemon (PID {})", pid);
+                    println!("Stopping daemon (PID {})...", pid);
 
-                    // Wait briefly for graceful shutdown
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    // Poll for graceful shutdown (up to 30 seconds)
+                    let mut stopped = false;
+                    for _ in 0..60 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        if is_daemon_running().is_none() {
+                            stopped = true;
+                            break;
+                        }
+                    }
 
-                    // Check if still running
-                    if is_daemon_running().is_some() {
-                        println!("Daemon still running, sending SIGKILL...");
+                    if !stopped {
+                        println!("Daemon still running after 30s, sending SIGKILL...");
                         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
 
                     // Clean up PID file
