@@ -508,8 +508,8 @@ async fn process_session(
     }
 
     // Log cost if available (from Anthropic API)
-    if let Some(cost) = extraction.total_cost {
-        dlog!("  [Cost] ${:.4}", cost);
+    if let Some((input, output, cost)) = extraction.total_cost {
+        dlog!("  [Cost] {} in / {} out = ${:.4}", input, output, cost);
     }
 
     if extraction.insights.is_empty() {

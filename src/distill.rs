@@ -80,8 +80,8 @@ pub struct ExtractionResult {
     /// All extracted insights (one per chunk, or single for small transcripts)
     pub insights: Vec<ExtractedInsight>,
     pub chunks_used: usize,
-    /// Total cost in USD (if available from API)
-    pub total_cost: Option<f64>,
+    /// Total cost info (input_tokens, output_tokens, cost_usd) if available from API
+    pub total_cost: Option<(u32, u32, f64)>,
 }
 
 /// Extract knowledge from a formatted transcript
@@ -111,7 +111,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
     // Small transcript: single LLM call
     if token_count <= CHUNK_THRESHOLD_TOKENS {
         let result = call_extraction_llm(transcript).await?;
-        let cost = result.cost.map(|(_, _, usd)| usd);
+        let cost = result.cost;
         let content = result.text.trim().to_string();
 
         if content.len() < MIN_CONTENT_LEN {
@@ -158,12 +158,16 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
     // If any chunk hit a rate limit, propagate that error immediately
     let mut indexed_distillations: Vec<(usize, String)> = Vec::new();
     let mut dropped_count = 0;
+    let mut total_input: u32 = 0;
+    let mut total_output: u32 = 0;
     let mut total_cost: f64 = 0.0;
 
     for (i, result) in chunk_results {
         match result {
             Ok(llm_result) => {
-                if let Some((_, _, cost)) = llm_result.cost {
+                if let Some((input, output, cost)) = llm_result.cost {
+                    total_input += input;
+                    total_output += output;
                     total_cost += cost;
                 }
                 let trimmed = llm_result.text.trim();
@@ -206,7 +210,7 @@ pub async fn extract_knowledge(transcript: &str) -> Result<ExtractionResult, llm
     Ok(ExtractionResult {
         insights,
         chunks_used: chunk_count,
-        total_cost: if total_cost > 0.0 { Some(total_cost) } else { None },
+        total_cost: if total_cost > 0.0 { Some((total_input, total_output, total_cost)) } else { None },
     })
 }
 
