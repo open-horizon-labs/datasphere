@@ -3,3 +3,4 @@
 # Superego
 .superego/
 .wm/
+.env
