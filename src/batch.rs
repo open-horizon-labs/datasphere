@@ -317,8 +317,8 @@ impl BatchQueue {
 
     /// Add a request to the queue
     /// For unchunked sessions, chunk_index and total_chunks should be None
-    pub fn add(&mut self, session_id: String, system_prompt: String, message: String, simhash: i64) {
-        self.add_chunk(session_id, system_prompt, message, simhash, None, None);
+    pub fn add(&mut self, session_id: String, system_prompt: String, message: String, simhash: i64) -> Result<(), BatchError> {
+        self.add_chunk(session_id, system_prompt, message, simhash, None, None)
     }
 
     /// Add a chunked request to the queue
@@ -331,7 +331,7 @@ impl BatchQueue {
         simhash: i64,
         chunk_index: Option<usize>,
         total_chunks: Option<usize>,
-    ) {
+    ) -> Result<(), BatchError> {
         // Use nanoseconds to prevent collisions when multiple requests are queued in same second
         let timestamp_nanos = Utc::now().timestamp_nanos_opt().unwrap_or_else(|| Utc::now().timestamp() * 1_000_000_000);
         let custom_id = match chunk_index {
@@ -348,6 +348,7 @@ impl BatchQueue {
             chunk_index,
             total_chunks,
         });
+        self.save_state()
     }
 
     /// Check if batch should be submitted
@@ -678,9 +679,11 @@ mod tests {
 
     #[test]
     fn test_should_submit_count_threshold() {
-        let mut queue = BatchQueue::new("test".to_string(), PathBuf::from("/tmp/test"));
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("batch_state.jsonl");
+        let mut queue = BatchQueue::new("test".to_string(), state_path);
         for i in 0..BATCH_MIN_COUNT {
-            queue.add(format!("sess_{}", i), "system".to_string(), "message".to_string(), i as i64);
+            queue.add(format!("sess_{}", i), "system".to_string(), "message".to_string(), i as i64).unwrap();
         }
         assert!(queue.should_submit());
     }
