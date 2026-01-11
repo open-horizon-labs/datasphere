@@ -31,6 +31,7 @@ arrow-schema = "56"
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "signal"] }
+tokio-util = "0.7"
 futures = "0.3"
 
 # HTTP client for OpenAI API

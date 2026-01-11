@@ -1,12 +1,17 @@
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use datasphere::{
-    chunk_text, discover_sessions, discover_sessions_in_dir, embed, extract_knowledge,
-    list_all_projects, read_transcript, AllProjectsWatcher, Job, JobStatus, LlmError, Node,
-    Processed, Queue, SessionInfo, SourceType, Store,
+    chunk_text, chunk_transcript, discover_sessions, discover_sessions_in_dir, distill_chunk,
+    embed, list_all_projects, read_transcript, resolve_anthropic_model, AllProjectsWatcher,
+    BatchQueue, EmbedError, Job, JobStatus, LlmError, Node, Processed, Queue, SessionInfo,
+    SourceType, Store,
 };
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -179,6 +184,26 @@ fn daemon_log_path() -> PathBuf {
         .join("daemon.log")
 }
 
+/// Load blacklisted project IDs from ~/.datasphere/blacklist
+/// Returns empty set if file doesn't exist.
+/// File format: one project ID per line, # for comments.
+fn load_blacklist() -> HashSet<String> {
+    let path = dirs::home_dir()
+        .map(|h| h.join(".datasphere").join("blacklist"))
+        .unwrap_or_default();
+
+    std::fs::read_to_string(&path)
+        .map(|content| {
+            content
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Number of old log files to keep
 const LOG_ROTATION_KEEP: usize = 7;
 
@@ -349,6 +374,8 @@ const SIMHASH_CHANGE_THRESHOLD: u32 = 10;
 enum ProcessError {
     /// Rate limit hit - caller should back off
     RateLimit(String),
+    /// Request was cancelled (e.g., daemon shutdown)
+    Cancelled,
     /// Other errors
     Other(String),
 }
@@ -357,6 +384,7 @@ impl std::fmt::Display for ProcessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessError::RateLimit(msg) => write!(f, "Rate limit: {}", msg),
+            ProcessError::Cancelled => write!(f, "Request cancelled"),
             ProcessError::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -368,6 +396,7 @@ impl From<LlmError> for ProcessError {
     fn from(e: LlmError) -> Self {
         match e {
             LlmError::RateLimit(msg) => ProcessError::RateLimit(msg),
+            LlmError::Cancelled => ProcessError::Cancelled,
             LlmError::Other(msg) => ProcessError::Other(msg),
         }
     }
@@ -385,9 +414,12 @@ impl From<lancedb::Error> for ProcessError {
     }
 }
 
-impl From<datasphere::EmbedError> for ProcessError {
-    fn from(e: datasphere::EmbedError) -> Self {
-        ProcessError::Other(e.to_string())
+impl From<EmbedError> for ProcessError {
+    fn from(e: EmbedError) -> Self {
+        match e {
+            EmbedError::Cancelled => ProcessError::Cancelled,
+            _ => ProcessError::Other(e.to_string()),
+        }
     }
 }
 
@@ -406,12 +438,25 @@ fn transcript_has_content(path: &std::path::Path) -> bool {
     }
 }
 
-/// Process a single session transcript
-/// Returns (nodes_created, skipped) tuple
+/// Result type for process_session
+enum ProcessResult {
+    /// Session was processed immediately, created N nodes
+    Processed(usize),
+    /// Session was skipped (empty or unchanged)
+    Skipped,
+    /// Session was queued for batch processing
+    QueuedForBatch,
+}
+
+/// Process a single session transcript with incremental chunk processing
+/// AIDEV-NOTE: Compares per-chunk simhashes to only re-distill changed chunks.
+/// Returns ProcessResult indicating what happened
 async fn process_session(
     store: &Store,
     session: &SessionInfo,
-) -> Result<(usize, bool), ProcessError> {
+    cancel_token: &CancellationToken,
+    _batch_queue: Option<Arc<Mutex<BatchQueue>>>,
+) -> Result<ProcessResult, ProcessError> {
     dlog!("  Reading transcript...");
 
     // Parse transcript
@@ -420,7 +465,7 @@ async fn process_session(
 
     if entries.is_empty() {
         dlog!("  Empty transcript, skipping");
-        return Ok((0, true));
+        return Ok(ProcessResult::Skipped);
     }
 
     // Get all messages for context
@@ -431,7 +476,7 @@ async fn process_session(
 
     if messages.is_empty() {
         dlog!("  No messages found, skipping");
-        return Ok((0, true));
+        return Ok(ProcessResult::Skipped);
     }
 
     // Count message types
@@ -451,16 +496,18 @@ async fn process_session(
     let context = datasphere::format_context(&messages);
     if context.trim().is_empty() {
         dlog!("  Empty context after formatting, skipping");
-        return Ok((0, true));
+        return Ok(ProcessResult::Skipped);
     }
 
     dlog!("  Context size: {} chars", context.len());
 
-    // Compute SimHash of context
+    // Compute overall SimHash of context for quick change detection
     let current_simhash = simhash::simhash(&context) as i64;
 
-    // Check if already processed
-    if let Some(existing) = store.get_processed(&session.session_id).await? {
+    // Check if session was previously processed
+    let existing_processed = store.get_processed(&session.session_id).await?;
+
+    if let Some(ref existing) = existing_processed {
         let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
 
         if hamming <= SIMHASH_CHANGE_THRESHOLD {
@@ -468,85 +515,184 @@ async fn process_session(
                 "  Unchanged (simhash distance: {} bits, threshold: {})",
                 hamming, SIMHASH_CHANGE_THRESHOLD
             );
-            return Ok((0, true));
+            return Ok(ProcessResult::Skipped);
         }
 
         dlog!(
-            "  Session changed (simhash distance: {} bits), re-distilling...",
+            "  Session changed (simhash distance: {} bits), checking chunks...",
             hamming
         );
+    }
 
-        // Delete old nodes, then processed record
-        let node_ids: Vec<Uuid> = existing.node_ids
-            .iter()
-            .filter_map(|id| id.parse::<Uuid>().ok())
-            .collect();
-        if !node_ids.is_empty() {
-            store.delete_nodes(&node_ids).await?;
-            dlog!("  Deleted {} old node(s)", node_ids.len());
+    // Chunk the transcript and compute per-chunk simhashes
+    let chunks = chunk_transcript(&context);
+    let chunk_simhashes: Vec<i64> = chunks
+        .iter()
+        .map(|chunk| simhash::simhash(chunk) as i64)
+        .collect();
+
+    dlog!("  Split into {} chunk(s)", chunks.len());
+
+    // Get existing nodes for this session (for incremental comparison)
+    let existing_nodes = store.get_nodes_by_source(&session.session_id).await?;
+
+    // Build lookup maps for existing chunks:
+    // 1. chunk_index -> node (primary, more reliable)
+    // 2. simhash -> nodes (fallback for shifted boundaries)
+    // AIDEV-NOTE: Prefer chunk_index matching to avoid simhash collision mis-association
+    let mut existing_by_index: HashMap<i32, &Node> = HashMap::new();
+    let mut existing_by_simhash: HashMap<i64, Vec<&Node>> = HashMap::new();
+    for node in &existing_nodes {
+        if let Some(chunk_index) = node.chunk_index {
+            existing_by_index.insert(chunk_index, node);
         }
-        store.delete_processed(&session.session_id).await?;
-    }
-
-    // Distill knowledge via LLM
-    dlog!("  Distilling via LLM...");
-    let distill_start = Instant::now();
-    let extraction = match extract_knowledge(&context).await {
-        Ok(result) => result,
-        Err(e) => {
-            dlog!("  LLM extraction failed: {}", e);
-            return Err(e.into());
+        if let Some(chunk_simhash) = node.chunk_simhash {
+            existing_by_simhash
+                .entry(chunk_simhash)
+                .or_default()
+                .push(node);
         }
-    };
-    let distill_elapsed = distill_start.elapsed();
-
-    // Log chunking info if used
-    if extraction.chunks_used > 1 {
-        dlog!("  Distilled {} chunks in {:.1}s", extraction.chunks_used, distill_elapsed.as_secs_f32());
-    } else {
-        dlog!("  Distilled in {:.1}s", distill_elapsed.as_secs_f32());
     }
 
-    // Log cost if available (from Anthropic API)
-    if let Some((input, output, cost)) = extraction.total_cost {
-        dlog!("  [Cost] {} in / {} out = ${:.4}", input, output, cost);
+    // Determine which chunks need distillation (new or changed)
+    let mut chunks_to_distill: Vec<(usize, &str, i64)> = Vec::new();
+    let mut kept_node_ids: HashSet<Uuid> = HashSet::new();
+    let mut new_chunk_simhashes: HashSet<i64> = HashSet::new();
+
+    for (i, (chunk, &chunk_simhash)) in chunks.iter().zip(chunk_simhashes.iter()).enumerate() {
+        new_chunk_simhashes.insert(chunk_simhash);
+        let chunk_idx = i as i32;
+
+        // Try matching by chunk_index first (more reliable)
+        if let Some(node) = existing_by_index.get(&chunk_idx) {
+            if node.chunk_simhash == Some(chunk_simhash) {
+                // Same index, same content - keep existing node
+                kept_node_ids.insert(node.id);
+                dlog!("    Chunk {} unchanged (index match, simhash {:016x})", i + 1, chunk_simhash as u64);
+                continue;
+            }
+        }
+
+        // Fallback: match by simhash (handles shifted boundaries)
+        if let Some(nodes) = existing_by_simhash.get(&chunk_simhash) {
+            // Take first matching node not already kept
+            if let Some(node) = nodes.iter().find(|n| !kept_node_ids.contains(&n.id)) {
+                kept_node_ids.insert(node.id);
+                dlog!("    Chunk {} unchanged (simhash match {:016x}, was index {})",
+                    i + 1, chunk_simhash as u64, node.chunk_index.unwrap_or(-1));
+                continue;
+            }
+        }
+
+        // New or changed chunk - needs distillation
+        chunks_to_distill.push((i, chunk, chunk_simhash));
     }
 
-    if extraction.insights.is_empty() {
-        dlog!("  No substantive knowledge found");
-        // Still record as processed
+    // Collect orphaned node IDs (chunks that no longer exist)
+    // AIDEV-NOTE: Defer deletion until after successful insert to avoid data loss on failure
+    let orphan_node_ids: Vec<Uuid> = existing_nodes
+        .iter()
+        .filter(|node| !kept_node_ids.contains(&node.id))
+        .map(|node| node.id)
+        .collect();
+
+    if chunks_to_distill.is_empty() {
+        dlog!("  All chunks unchanged, keeping {} existing node(s)", kept_node_ids.len());
+
+        // Delete old processed record if it exists (will re-create with updated info)
+        if existing_processed.is_some() {
+            store.delete_processed(&session.session_id).await?;
+        }
+
+        // Re-record as processed with current simhash
+        let node_ids: Vec<String> = kept_node_ids.iter().map(|id| id.to_string()).collect();
         let record = Processed {
             source_id: session.session_id.clone(),
             source_type: "session".to_string(),
             simhash: current_simhash,
             processed_at: Utc::now(),
-            node_count: 0,
-            node_ids: Vec::new(),
+            node_count: node_ids.len() as i32,
+            node_ids,
         };
         store.insert_processed(&record).await?;
-        return Ok((0, false));
+
+        // Now safe to delete orphaned nodes (new record already saved)
+        if !orphan_node_ids.is_empty() {
+            store.delete_nodes(&orphan_node_ids).await?;
+            dlog!("  Deleted {} orphaned node(s)", orphan_node_ids.len());
+        }
+
+        return Ok(ProcessResult::Processed(0)); // 0 new nodes created
     }
 
-    dlog!("  Extracted {} insight(s)", extraction.insights.len());
+    dlog!(
+        "  Distilling {} changed chunk(s), keeping {} unchanged...",
+        chunks_to_distill.len(),
+        kept_node_ids.len()
+    );
 
-    // Embed and store each insight as a separate node
-    let total_insights = extraction.insights.len();
-    let mut node_ids = Vec::new();
-    for (i, insight) in extraction.insights.into_iter().enumerate() {
-        let embed_start = Instant::now();
-        let embedding = embed(&insight.content).await?;
-        dlog!("  Embedded {}/{} in {:.1}s", i + 1, total_insights, embed_start.elapsed().as_secs_f32());
+    // Distill changed chunks
+    let distill_start = Instant::now();
+    let mut new_node_ids: Vec<String> = Vec::new();
+    let total_to_distill = chunks_to_distill.len();
 
-        let node = insight.into_node(
-            session.session_id.clone(),
-            SourceType::Session,
-            embedding,
-        );
-        let node_id = node.id.to_string();
+    for (processed, (chunk_idx, chunk, chunk_simhash)) in chunks_to_distill.into_iter().enumerate() {
+        // Distill the chunk
+        match distill_chunk(chunk, cancel_token).await {
+            Ok(Some(insight)) => {
+                // Embed and store
+                let embed_start = Instant::now();
+                let embedding = embed(&insight.content, cancel_token).await?;
+                dlog!(
+                    "    Chunk {} distilled + embedded in {:.1}s ({}/{})",
+                    chunk_idx + 1,
+                    embed_start.elapsed().as_secs_f32(),
+                    processed + 1,
+                    total_to_distill
+                );
 
-        store.insert_node(&node).await?;
+                let node = Node::with_chunk(
+                    insight.content,
+                    session.session_id.clone(),
+                    SourceType::Session,
+                    embedding,
+                    insight.confidence,
+                    "personal".to_string(),
+                    chunk_simhash,
+                    chunk_idx as i32,
+                );
+                let node_id = node.id.to_string();
+                store.insert_node(&node).await?;
+                new_node_ids.push(node_id);
+            }
+            Ok(None) => {
+                dlog!("    Chunk {} distillation too short, skipping", chunk_idx + 1);
+            }
+            Err(LlmError::RateLimit(msg)) => {
+                return Err(ProcessError::RateLimit(msg));
+            }
+            Err(LlmError::Cancelled) => {
+                return Err(ProcessError::Cancelled);
+            }
+            Err(e) => {
+                dlog!("    Chunk {} distillation failed: {}", chunk_idx + 1, e);
+                // Continue with other chunks
+            }
+        }
+    }
 
-        node_ids.push(node_id);
+    dlog!("  Distillation completed in {:.1}s", distill_start.elapsed().as_secs_f32());
+
+    // Combine kept and new node IDs
+    let all_node_ids: Vec<String> = kept_node_ids
+        .iter()
+        .map(|id| id.to_string())
+        .chain(new_node_ids.iter().cloned())
+        .collect();
+
+    // Delete old processed record if it exists (before inserting new one)
+    if existing_processed.is_some() {
+        store.delete_processed(&session.session_id).await?;
     }
 
     // Record as processed
@@ -555,13 +701,150 @@ async fn process_session(
         source_type: "session".to_string(),
         simhash: current_simhash,
         processed_at: Utc::now(),
-        node_count: node_ids.len() as i32,
-        node_ids,
+        node_count: all_node_ids.len() as i32,
+        node_ids: all_node_ids,
     };
     store.insert_processed(&record).await?;
 
-    dlog!("  Done! Created {} node(s)", record.node_count);
-    Ok((record.node_count as usize, false))
+    // Now safe to delete orphaned nodes (new data already saved)
+    if !orphan_node_ids.is_empty() {
+        store.delete_nodes(&orphan_node_ids).await?;
+        dlog!("  Deleted {} orphaned node(s)", orphan_node_ids.len());
+    }
+
+    dlog!(
+        "  Done! {} new node(s), {} kept, {} total",
+        new_node_ids.len(),
+        kept_node_ids.len(),
+        record.node_count
+    );
+    Ok(ProcessResult::Processed(new_node_ids.len()))
+}
+
+/// Process completed batch results
+/// AIDEV-NOTE: Batch results contain distilled text that needs to be embedded and stored
+/// For chunked sessions, results are aggregated into multiple nodes per session
+async fn process_batch_results(
+    store: &Store,
+    batch_queue: &Arc<Mutex<BatchQueue>>,
+    cancel_token: &CancellationToken,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+
+    // Poll for completed batches
+    // AIDEV-NOTE: Using tokio::sync::Mutex to safely hold lock across await
+    let completed = {
+        let mut bq = batch_queue.lock().await;
+        bq.poll_pending().await.map_err(|e| format!("Poll error: {}", e))?
+    };
+
+    if completed.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total_nodes = 0;
+
+    for (batch, results) in completed {
+        dlog!("[BATCH] Processing completed batch {} ({} results)", &batch.batch_id[..8.min(batch.batch_id.len())], results.len());
+
+        // Get request metadata for this batch
+        let request_meta = {
+            let bq = batch_queue.lock().await;
+            bq.get_request_meta(&batch)
+        };
+
+        // Group results by session_id for chunk aggregation
+        // AIDEV-NOTE: Multiple chunks from same session become multiple nodes, one Processed record
+        let mut session_results: HashMap<String, Vec<(String, i64, Option<usize>)>> = HashMap::new();
+
+        for result in results {
+            // Get metadata for this result
+            let meta = request_meta.get(&result.custom_id);
+            let (session_id, simhash, chunk_index) = match meta {
+                Some(m) => (m.session_id.clone(), m.simhash, m.chunk_index),
+                None => {
+                    // Fallback: parse custom_id
+                    let sid = result.custom_id.split(':').next().unwrap_or(&result.custom_id).to_string();
+                    (sid, 0, None)
+                }
+            };
+
+            match result.result_type.as_str() {
+                "succeeded" => {
+                    if let Some(text) = result.text {
+                        let trimmed = text.trim();
+                        if trimmed.len() >= 50 {
+                            // Embed the distilled content
+                            let embedding = embed(trimmed, cancel_token).await?;
+
+                            // Create and store node with chunk metadata
+                            let node = Node::with_chunk(
+                                trimmed.to_string(),
+                                session_id.clone(),
+                                SourceType::Session,
+                                embedding,
+                                1.0,
+                                "personal".to_string(),
+                                simhash,
+                                chunk_index.unwrap_or(0) as i32,
+                            );
+                            let node_id = node.id.to_string();
+                            store.insert_node(&node).await?;
+
+                            // Track this node for the session
+                            session_results
+                                .entry(session_id.clone())
+                                .or_default()
+                                .push((node_id, simhash, chunk_index));
+
+                            let chunk_info = chunk_index.map(|i| format!(" chunk {}", i)).unwrap_or_default();
+                            dlog!("    {}{} -> created node", &session_id[..8.min(session_id.len())], chunk_info);
+                            total_nodes += 1;
+                        } else {
+                            dlog!("    {} -> distillation too short ({} chars)", &session_id[..8.min(session_id.len())], trimmed.len());
+                        }
+                    }
+                }
+                "errored" => {
+                    let err_msg = result.error.as_deref().unwrap_or("unknown error");
+                    dlog!("    {} -> error: {}", &session_id[..8.min(session_id.len())], err_msg);
+                }
+                other => {
+                    dlog!("    {} -> {}", &session_id[..8.min(session_id.len())], other);
+                }
+            }
+
+            // Log cost if available
+            if let Some(usage) = result.usage {
+                dlog!("    [Cost] {} in / {} out", usage.input_tokens, usage.output_tokens);
+            }
+        }
+
+        // Create Processed records for each session (aggregating all chunks)
+        for (session_id, nodes_info) in session_results {
+            if nodes_info.is_empty() {
+                continue;
+            }
+
+            // Use simhash from first chunk (all chunks have same session simhash)
+            let simhash = nodes_info[0].1;
+            let node_ids: Vec<String> = nodes_info.into_iter().map(|(id, _, _)| id).collect();
+            let node_count = node_ids.len() as i32;
+
+            let record = Processed {
+                source_id: session_id.clone(),
+                source_type: "session".to_string(),
+                simhash,
+                processed_at: Utc::now(),
+                node_count,
+                node_ids,
+            };
+            store.insert_processed(&record).await?;
+            dlog!("    {} -> recorded {} node(s)", &session_id[..8.min(session_id.len())], node_count);
+        }
+    }
+
+    Ok(total_nodes)
 }
 
 /// Process a single text file (no LLM distillation, direct embedding)
@@ -569,6 +852,7 @@ async fn process_session(
 async fn process_file(
     store: &Store,
     file_path: &PathBuf,
+    cancel_token: &CancellationToken,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // Canonicalize path to avoid duplicates
     let canonical_path = file_path.canonicalize()
@@ -591,8 +875,10 @@ async fn process_file(
     // Compute SimHash
     let current_simhash = simhash::simhash(&content) as i64;
 
-    // Check if already processed
-    if let Some(existing) = store.get_processed(&source_id).await? {
+    // Check if already processed - collect old node IDs but defer deletion
+    // AIDEV-NOTE: Defer deletion until after successful insert to avoid data loss on failure
+    let existing_processed = store.get_processed(&source_id).await?;
+    let old_node_ids: Vec<Uuid> = if let Some(ref existing) = existing_processed {
         let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
 
         if hamming <= SIMHASH_CHANGE_THRESHOLD {
@@ -608,17 +894,14 @@ async fn process_file(
             hamming
         );
 
-        // Delete old nodes, then processed record
-        let node_ids: Vec<Uuid> = existing.node_ids
+        // Collect old node IDs for deferred deletion
+        existing.node_ids
             .iter()
             .filter_map(|id| id.parse::<Uuid>().ok())
-            .collect();
-        if !node_ids.is_empty() {
-            store.delete_nodes(&node_ids).await?;
-            dlog!("  Deleted {} old node(s)", node_ids.len());
-        }
-        store.delete_processed(&source_id).await?;
-    }
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Chunk content if needed
     let chunks = chunk_text(&content);
@@ -628,7 +911,7 @@ async fn process_file(
     let mut node_ids = Vec::new();
     for (i, chunk) in chunks.iter().enumerate() {
         let embed_start = Instant::now();
-        let embedding = embed(chunk).await?;
+        let embedding = embed(chunk, cancel_token).await?;
         dlog!("  Embedded {}/{} in {:.1}s", i + 1, chunks.len(), embed_start.elapsed().as_secs_f32());
 
         let node = Node::new(
@@ -644,6 +927,11 @@ async fn process_file(
         node_ids.push(node_id);
     }
 
+    // Delete old processed record if it exists (before inserting new one)
+    if existing_processed.is_some() {
+        store.delete_processed(&source_id).await?;
+    }
+
     // Record as processed
     let record = Processed {
         source_id: source_id.clone(),
@@ -654,6 +942,12 @@ async fn process_file(
         node_ids,
     };
     store.insert_processed(&record).await?;
+
+    // Now safe to delete old nodes (new data already saved)
+    if !old_node_ids.is_empty() {
+        store.delete_nodes(&old_node_ids).await?;
+        dlog!("  Deleted {} old node(s)", old_node_ids.len());
+    }
 
     dlog!("  Done! Created {} node(s)", record.node_count);
     Ok(record.node_count as usize)
@@ -666,6 +960,7 @@ async fn process_note(
     content: &str,
     source_tag: &str,
     namespace: &str,
+    cancel_token: &CancellationToken,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let timestamp = Utc::now();
     let source_id = format!("{}:{}", source_tag, timestamp.to_rfc3339());
@@ -687,7 +982,7 @@ async fn process_note(
     let mut node_ids = Vec::new();
     for (i, chunk) in chunks.iter().enumerate() {
         let embed_start = Instant::now();
-        let embedding = embed(chunk).await?;
+        let embedding = embed(chunk, cancel_token).await?;
         println!(
             "  Embedded {}/{} in {:.1}s",
             i + 1,
@@ -756,6 +1051,9 @@ async fn run_scan(
     println!("\nDatabase: {}", db_path.display());
     let store = Store::open(db_path.to_str().unwrap()).await?;
 
+    // Create a cancel token for one-shot scan (won't be cancelled)
+    let cancel_token = CancellationToken::new();
+
     // Process each session
     let mut total_nodes = 0;
     let mut skipped = 0;
@@ -770,12 +1068,16 @@ async fn run_scan(
             format_size(session.size_bytes)
         );
 
-        match process_session(&store, session).await {
-            Ok((nodes, was_skipped)) => {
+        match process_session(&store, session, &cancel_token, None).await {
+            Ok(ProcessResult::Processed(nodes)) => {
                 total_nodes += nodes;
-                if was_skipped {
-                    skipped += 1;
-                }
+            }
+            Ok(ProcessResult::Skipped) => {
+                skipped += 1;
+            }
+            Ok(ProcessResult::QueuedForBatch) => {
+                // Scan mode doesn't use batching, this shouldn't happen
+                eprintln!("  Unexpectedly queued for batch");
             }
             Err(e) => {
                 eprintln!("  Error: {}", e);
@@ -900,6 +1202,36 @@ fn run_status() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Spawns a watchdog thread that detects system sleep by monitoring time jumps.
+/// Returns a receiver that fires when system wakes from sleep.
+///
+/// The watchdog runs in a std::thread (not tokio) so it's immune to tokio timer
+/// issues that can occur after macOS sleep. It uses blocking_send to bridge
+/// into the async world.
+fn spawn_sleep_watchdog() -> tokio::sync::mpsc::Receiver<()> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    std::thread::spawn(move || {
+        let mut last = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let elapsed = last.elapsed();
+            // If a 1-second sleep took >5 seconds, system likely slept
+            if elapsed > std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "[WATCHDOG] Detected ~{}s time jump (system sleep?)",
+                    elapsed.as_secs()
+                );
+                // blocking_send works from std::thread into tokio channel
+                let _ = tx.blocking_send(());
+            }
+            last = std::time::Instant::now();
+        }
+    });
+
+    rx
+}
+
 /// Run start command - daemon mode watching all projects (foreground)
 async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize global logger for daemon mode
@@ -925,12 +1257,48 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
         dlog!("Resuming {} pending, {} processing jobs from previous run", pending, processing);
     }
 
+    // Initialize batch queue for large sessions (50% cost savings)
+    // AIDEV-NOTE: Sessions >12K tokens are queued for batch API processing
+    // Uses resolve_anthropic_model() for consistent model IDs with real-time processing
+    let model_env = std::env::var("DATASPHERE_MODEL").unwrap_or_else(|_| "opus".to_string());
+    let batch_model = resolve_anthropic_model(&model_env).to_string();
+    let batch_state_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".datasphere")
+        .join("batch_queue.jsonl");
+    let batch_queue = Arc::new(Mutex::new(BatchQueue::new(
+        batch_model,
+        batch_state_path,
+    )));
+
+    // Load any pending batches from previous run
+    {
+        let mut bq = batch_queue.lock().await;
+        if let Err(e) = bq.load_state() {
+            dlog!("Warning: failed to load batch state: {}", e);
+        }
+        let pending_batches = bq.pending_batch_count();
+        let queued_requests = bq.queued_request_count();
+        if pending_batches > 0 || queued_requests > 0 {
+            dlog!("Batch queue: {} pending batch(es), {} queued request(s)", pending_batches, queued_requests);
+        }
+    }
+
     // Scan existing sessions and queue unprocessed ones
     dlog!("\nScanning existing sessions...");
     let projects = list_all_projects().unwrap_or_default();
+    let blacklist = load_blacklist();
+    if !blacklist.is_empty() {
+        dlog!("Blacklist: {} project(s)", blacklist.len());
+    }
     let mut queued_initial = 0;
 
     for project in &projects {
+        // Skip blacklisted projects
+        if blacklist.contains(&project.project_id) {
+            dlog!("[SKIP] Blacklisted: {}", project.project_id);
+            continue;
+        }
         if let Ok(sessions) = discover_sessions_in_dir(&project.project_dir) {
             for session in sessions {
                 // Check if already processed
@@ -966,9 +1334,9 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
         dlog!("All sessions already processed");
     }
 
-    // Create all-projects watcher
+    // Create all-projects watcher (mutable so we can recreate on wake)
     dlog!("\nStarting all-projects watcher...");
-    let watcher = match AllProjectsWatcher::new() {
+    let mut watcher = match AllProjectsWatcher::new() {
         Ok(w) => w,
         Err(e) => {
             dlog!("Failed to create watcher: {}", e);
@@ -981,10 +1349,21 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
     let mut queued_count = 0;
     let mut processed_count = 0;
     let mut total_nodes = 0;
+    let mut batched_count = 0;
+
+    // Batch polling interval tracking
+    let mut last_batch_poll = Instant::now();
+    const BATCH_POLL_INTERVAL: Duration = Duration::from_secs(60); // Poll batches every minute
 
     // Rate limit backoff state (local to single-threaded daemon loop)
     let mut rate_limit_backoff_secs: u64 = 0;
     let mut rate_limit_until: Option<Instant> = None;
+
+    // Spawn sleep watchdog to detect system sleep/wake
+    let mut wake_rx = spawn_sleep_watchdog();
+
+    // Create cancellation token for graceful shutdown of in-flight requests
+    let cancel_token = CancellationToken::new();
 
     dlog!("\nDaemon running (Ctrl+C to stop)...\n");
 
@@ -1001,7 +1380,8 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
             use tokio::time::timeout;
             // Non-blocking check for SIGTERM
             if let Ok(Some(())) = timeout(Duration::from_millis(0), sigterm.recv()).await {
-                dlog!("\n[SHUTDOWN] Received SIGTERM, shutting down...");
+                dlog!("\n[SHUTDOWN] Received SIGTERM, cancelling in-flight requests...");
+                cancel_token.cancel();
                 shutdown = true;
                 continue;
             }
@@ -1010,13 +1390,19 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
         {
             use tokio::time::timeout;
             if let Ok(Ok(())) = timeout(Duration::from_millis(0), tokio::signal::ctrl_c()).await {
-                dlog!("\n[SHUTDOWN] Received Ctrl+C, shutting down...");
+                dlog!("\n[SHUTDOWN] Received Ctrl+C, cancelling in-flight requests...");
+                cancel_token.cancel();
                 shutdown = true;
                 continue;
             }
         }
         // Drain all pending watcher events into queue
         while let Some(event) = watcher.try_recv() {
+            // Skip blacklisted projects
+            if blacklist.contains(&event.project_id) {
+                continue;
+            }
+
             // Skip empty transcripts
             if !transcript_has_content(&event.session.transcript_path) {
                 continue;
@@ -1052,7 +1438,14 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
             let remaining = until.saturating_duration_since(Instant::now());
             if !remaining.is_zero() {
                 // Sleep for remaining time, capped at 1s for signal responsiveness
-                tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+                // Use select! so we can wake up early if system resumes from sleep
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(1))) => {},
+                    _ = wake_rx.recv() => {
+                        dlog!("[WAKE] System resumed from sleep, reinitializing watcher...");
+                        watcher = AllProjectsWatcher::new()?;
+                    }
+                }
                 continue;
             } else {
                 // Backoff period ended
@@ -1079,8 +1472,8 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(0),
             };
 
-            match process_session(&store, &session).await {
-                Ok((nodes, was_skipped)) => {
+            match process_session(&store, &session, &cancel_token, Some(Arc::clone(&batch_queue))).await {
+                Ok(ProcessResult::Processed(nodes)) => {
                     // Success - reset backoff on successful processing
                     if rate_limit_backoff_secs > 0 {
                         dlog!("[RATE_LIMIT] Success after backoff, resetting backoff state");
@@ -1090,9 +1483,28 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(e) = queue.mark_done(&job.source_id) {
                         dlog!("  Failed to mark done: {}", e);
                     }
-                    if !was_skipped {
-                        processed_count += 1;
-                        total_nodes += nodes;
+                    processed_count += 1;
+                    total_nodes += nodes;
+                }
+                Ok(ProcessResult::Skipped) => {
+                    // Already processed or empty
+                    if let Err(e) = queue.mark_done(&job.source_id) {
+                        dlog!("  Failed to mark done: {}", e);
+                    }
+                }
+                Ok(ProcessResult::QueuedForBatch) => {
+                    // Large session queued for batch processing
+                    if let Err(e) = queue.mark_done(&job.source_id) {
+                        dlog!("  Failed to mark done: {}", e);
+                    }
+                    batched_count += 1;
+                }
+                Err(ProcessError::Cancelled) => {
+                    // Request cancelled (shutdown in progress)
+                    // Return job to pending state so it will be retried on next start
+                    dlog!("[CANCELLED] Job interrupted, returning to pending");
+                    if let Err(e) = queue.mark_pending(&job.source_id) {
+                        dlog!("  Failed to return job to pending: {}", e);
                     }
                 }
                 Err(ProcessError::RateLimit(msg)) => {
@@ -1127,21 +1539,84 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Rate limit between jobs (only if not in backoff)
+            // Use select! so we can wake up early if system resumes from sleep
             if rate_limit_until.is_none() {
-                tokio::time::sleep(Duration::from_millis(JOB_DELAY_MS)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(JOB_DELAY_MS)) => {},
+                    _ = wake_rx.recv() => {
+                        dlog!("[WAKE] System resumed from sleep, reinitializing watcher...");
+                        watcher = AllProjectsWatcher::new()?;
+                    }
+                }
             }
         } else {
             // No pending jobs, sleep briefly before checking again
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Use select! so we can wake up early if system resumes from sleep
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                _ = wake_rx.recv() => {
+                    dlog!("[WAKE] System resumed from sleep, reinitializing watcher...");
+                    watcher = AllProjectsWatcher::new()?;
+                }
+            }
+        }
+
+        // Batch processing: check for submission and poll for results
+        // AIDEV-NOTE: Only do this periodically to avoid excessive API calls
+        if last_batch_poll.elapsed() >= BATCH_POLL_INTERVAL {
+            last_batch_poll = Instant::now();
+
+            // Check if we should submit a batch
+            let should_submit = {
+                let bq = batch_queue.lock().await;
+                bq.should_submit()
+            };
+
+            if should_submit {
+                dlog!("[BATCH] Submitting queued requests...");
+                let submit_result = {
+                    let mut bq = batch_queue.lock().await;
+                    bq.submit().await
+                };
+                match submit_result {
+                    Ok(batch_id) => {
+                        dlog!("[BATCH] Submitted batch: {}", &batch_id[..8.min(batch_id.len())]);
+                    }
+                    Err(e) => {
+                        dlog!("[BATCH] Submit error: {}", e);
+                    }
+                }
+            }
+
+            // Poll for completed batches and process results
+            match process_batch_results(&store, &batch_queue, &cancel_token).await {
+                Ok(nodes) if nodes > 0 => {
+                    total_nodes += nodes;
+                    dlog!("[BATCH] Created {} node(s) from batch results", nodes);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    dlog!("[BATCH] Error processing results: {}", e);
+                }
+            }
         }
     }
 
     // Clean up PID file on graceful shutdown
     let _ = std::fs::remove_file(daemon_pid_path());
 
+    // Save batch state before shutdown
+    {
+        let bq = batch_queue.lock().await;
+        if let Err(e) = bq.save_state() {
+            dlog!("Warning: failed to save batch state: {}", e);
+        }
+    }
+
     dlog!("\nDaemon stopped.");
     dlog!("  Queued:    {} sessions", queued_count);
     dlog!("  Processed: {} sessions", processed_count);
+    dlog!("  Batched:   {} sessions", batched_count);
     dlog!("  Nodes:     {} created", total_nodes);
     Ok(())
 }
@@ -1245,8 +1720,11 @@ async fn run_query(
 
     let store = Store::open(db_path.to_str().unwrap()).await?;
 
+    // Create a cancel token for one-shot query (won't be cancelled)
+    let cancel_token = CancellationToken::new();
+
     // Embed the query
-    let embedding = embed(query).await?;
+    let embedding = embed(query, &cancel_token).await?;
 
     // Search for similar nodes (fetch more if filtering)
     let fetch_limit = if namespace_filter.is_some() { limit * 3 } else { limit };
@@ -1466,11 +1944,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let db_path = default_db_path();
             let store = Store::open(db_path.to_str().unwrap()).await?;
+            let cancel_token = CancellationToken::new();
 
             println!("ds add");
             println!("==========");
 
-            match process_file(&store, &file).await {
+            match process_file(&store, &file, &cancel_token).await {
                 Ok(nodes) => {
                     if nodes > 0 {
                         println!("\nCreated {} node(s)", nodes);
@@ -1485,11 +1964,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Note { content, source, namespace } => {
             let db_path = default_db_path();
             let store = Store::open(db_path.to_str().unwrap()).await?;
+            let cancel_token = CancellationToken::new();
 
             println!("ds note");
             println!("==========");
 
-            match process_note(&store, &content, &source, &namespace).await {
+            match process_note(&store, &content, &source, &namespace, &cancel_token).await {
                 Ok(node_ids) => {
                     for id in &node_ids {
                         println!("  ID: {}", id);

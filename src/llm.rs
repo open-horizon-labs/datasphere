@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 const OPENAI_CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -25,6 +26,8 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 pub enum LlmError {
     /// Rate limit hit - caller should back off
     RateLimit(String),
+    /// Request was cancelled (e.g., daemon shutdown)
+    Cancelled,
     /// Other errors
     Other(String),
 }
@@ -42,6 +45,7 @@ impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LlmError::RateLimit(msg) => write!(f, "Rate limit: {}", msg),
+            LlmError::Cancelled => write!(f, "Request cancelled"),
             LlmError::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -131,8 +135,25 @@ fn is_openai_model(model: &str) -> bool {
 struct AnthropicRequest<'a> {
     model: &'a str,
     max_tokens: u32,
-    system: &'a str,
+    system: Vec<SystemBlock<'a>>,
     messages: Vec<AnthropicMessage<'a>>,
+}
+
+/// System prompt block with optional cache control
+/// AIDEV-NOTE: Using cache_control reduces cost by ~90% for cached tokens
+#[derive(Debug, Serialize)]
+struct SystemBlock<'a> {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +177,12 @@ struct AnthropicContent {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    /// Tokens read from cache (90% cheaper)
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    /// Tokens written to cache (25% more expensive, but saves on future reads)
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 /// Get Anthropic pricing per million tokens (input, output)
@@ -170,7 +197,14 @@ fn get_anthropic_pricing(model: &str) -> (f64, f64) {
 }
 
 /// Map short model names to full Anthropic model IDs
-fn resolve_anthropic_model(model: &str) -> &str {
+///
+/// Converts shorthand names to API-compatible model identifiers:
+/// - "haiku" → "claude-haiku-4-5"
+/// - "sonnet" → "claude-sonnet-4-5"
+/// - "opus" → "claude-opus-4-5"
+///
+/// Full model IDs are passed through unchanged.
+pub fn resolve_anthropic_model(model: &str) -> &str {
     match model {
         "haiku" => "claude-haiku-4-5",
         "sonnet" => "claude-sonnet-4-5",
@@ -184,6 +218,7 @@ async fn call_anthropic(
     system_prompt: &str,
     message: &str,
     model: &str,
+    cancel_token: &CancellationToken,
 ) -> Result<LlmResult, LlmError> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| LlmError::Other("ANTHROPIC_API_KEY not set".to_string()))?;
@@ -193,22 +228,35 @@ async fn call_anthropic(
     let request = AnthropicRequest {
         model: resolved_model,
         max_tokens: 16000,
-        system: system_prompt,
+        system: vec![SystemBlock {
+            block_type: "text",
+            text: system_prompt,
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral",
+            }),
+        }],
         messages: vec![AnthropicMessage {
             role: "user",
             content: message,
         }],
     };
 
-    let response = client
-        .post(ANTHROPIC_API_URL)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", ANTHROPIC_API_VERSION)
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| LlmError::Other(format!("Anthropic request failed: {}", e)))?;
+    // Race the HTTP request against cancellation
+    let response = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            return Err(LlmError::Cancelled);
+        }
+        result = client
+            .post(ANTHROPIC_API_URL)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", ANTHROPIC_API_VERSION)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send() => {
+            result.map_err(|e| LlmError::Other(format!("Anthropic request failed: {}", e)))?
+        }
+    };
 
     let status = response.status();
     let body = response
@@ -230,9 +278,16 @@ async fn call_anthropic(
     let parsed: AnthropicResponse = serde_json::from_str(&body)
         .map_err(|e| LlmError::Other(format!("Failed to parse response: {} - {}", e, body)))?;
 
-    // Calculate cost
+    // Calculate cost with cache pricing
+    // AIDEV-NOTE: Anthropic's usage fields are:
+    //   - input_tokens: NON-cached input tokens (billed at base price)
+    //   - cache_read_input_tokens: tokens read from cache (10% of base price)
+    //   - cache_creation_input_tokens: tokens written to cache (125% of base price)
+    //   Total input = input_tokens + cache_read + cache_creation
     let (input_price, output_price) = get_anthropic_pricing(resolved_model);
     let cost = (parsed.usage.input_tokens as f64 * input_price
+        + parsed.usage.cache_read_input_tokens as f64 * input_price * 0.1
+        + parsed.usage.cache_creation_input_tokens as f64 * input_price * 1.25
         + parsed.usage.output_tokens as f64 * output_price)
         / 1_000_000.0;
 
@@ -253,6 +308,7 @@ async fn call_openai(
     system_prompt: &str,
     message: &str,
     model: &str,
+    cancel_token: &CancellationToken,
 ) -> Result<LlmResult, LlmError> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| LlmError::Other("OPENAI_API_KEY not set".to_string()))?;
@@ -275,14 +331,21 @@ async fn call_openai(
         max_completion_tokens: if use_completion_tokens { Some(16000) } else { None },
     };
 
-    let response = client
-        .post(OPENAI_CHAT_URL)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| LlmError::Other(format!("OpenAI request failed: {}", e)))?;
+    // Race the HTTP request against cancellation
+    let response = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            return Err(LlmError::Cancelled);
+        }
+        result = client
+            .post(OPENAI_CHAT_URL)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send() => {
+            result.map_err(|e| LlmError::Other(format!("OpenAI request failed: {}", e)))?
+        }
+    };
 
     let status = response.status();
     let body = response
@@ -324,18 +387,23 @@ async fn call_openai(
 ///
 /// # Errors
 /// - `LlmError::RateLimit` if the API rate limit was hit
+/// - `LlmError::Cancelled` if the request was cancelled
 /// - `LlmError::Other` for all other errors
-pub async fn call_claude(system_prompt: &str, message: &str) -> Result<LlmResult, LlmError> {
-    let model = std::env::var("DATASPHERE_MODEL").unwrap_or_else(|_| "sonnet".to_string());
+pub async fn call_claude(
+    system_prompt: &str,
+    message: &str,
+    cancel_token: &CancellationToken,
+) -> Result<LlmResult, LlmError> {
+    let model = std::env::var("DATASPHERE_MODEL").unwrap_or_else(|_| "opus".to_string());
 
     // 1. OpenAI models → OpenAI API
     if is_openai_model(&model) {
-        return call_openai(system_prompt, message, &model).await;
+        return call_openai(system_prompt, message, &model, cancel_token).await;
     }
 
     // 2. ANTHROPIC_API_KEY set → Anthropic API (preferred)
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        return call_anthropic(system_prompt, message, &model).await;
+        return call_anthropic(system_prompt, message, &model, cancel_token).await;
     }
 
     // 3. Fallback: Claude CLI (no cost info available)
@@ -356,10 +424,16 @@ pub async fn call_claude(system_prompt: &str, message: &str) -> Result<LlmResult
         .arg("--model")
         .arg(&model);
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| LlmError::Other(format!("Failed to run claude CLI: {}", e)))?;
+    // Race the CLI command against cancellation
+    let output = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            return Err(LlmError::Cancelled);
+        }
+        result = cmd.output() => {
+            result.map_err(|e| LlmError::Other(format!("Failed to run claude CLI: {}", e)))?
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

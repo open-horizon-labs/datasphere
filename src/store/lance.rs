@@ -4,12 +4,18 @@ use arrow_array::{
 };
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
-use lancedb::{connect, Connection, Table, query::{QueryBase, ExecutableQuery}, DistanceType, table::NewColumnTransform};
+use lancedb::{connect, Connection, Table, query::{QueryBase, ExecutableQuery}, DistanceType};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::core::{Node, SourceType, EMBEDDING_DIM};
 use super::schema::{nodes_schema, processed_schema};
+
+/// Escape single quotes for SQL filter strings by doubling them.
+/// This prevents SQL injection in LanceDB filter expressions.
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
 
 /// Record of a processed source (session or file)
 /// AIDEV-NOTE: source_id is the key (session UUID or canonical file path).
@@ -44,23 +50,6 @@ impl Store {
                     .await?
             }
         };
-
-        // AIDEV-NOTE: Migration - add namespace column if missing (v0.1.4+)
-        // Check schema and add namespace column for existing databases
-        let schema = nodes.schema().await?;
-        let has_namespace = schema.fields().iter().any(|f| f.name() == "namespace");
-        if !has_namespace {
-            eprintln!("Migrating nodes table: adding namespace column...");
-            nodes
-                .add_columns(
-                    NewColumnTransform::SqlExpressions(vec![
-                        ("namespace".to_string(), "'personal'".to_string()),
-                    ]),
-                    None,
-                )
-                .await?;
-            eprintln!("Migration complete: all existing nodes assigned to 'personal' namespace");
-        }
 
         // Open or create processed table
         let processed = match db.open_table("processed").execute().await {
@@ -134,7 +123,7 @@ impl Store {
 
     /// Get processed record by source_id
     pub async fn get_processed(&self, source_id: &str) -> Result<Option<Processed>, lancedb::Error> {
-        let filter = format!("source_id = '{}'", source_id);
+        let filter = format!("source_id = '{}'", escape_sql_string(source_id));
 
         let mut results = self
             .processed
@@ -163,7 +152,7 @@ impl Store {
 
     /// Delete processed record by source_id (for re-processing)
     pub async fn delete_processed(&self, source_id: &str) -> Result<(), lancedb::Error> {
-        let filter = format!("source_id = '{}'", source_id);
+        let filter = format!("source_id = '{}'", escape_sql_string(source_id));
         self.processed.delete(&filter).await?;
         Ok(())
     }
@@ -229,6 +218,25 @@ impl Store {
         self.nodes.delete(&filter).await?;
         Ok(())
     }
+
+    /// Get all nodes for a given source (session or file)
+    /// AIDEV-NOTE: Used for incremental chunk processing - compare existing chunk simhashes
+    pub async fn get_nodes_by_source(&self, source: &str) -> Result<Vec<Node>, lancedb::Error> {
+        let filter = format!("source = '{}'", escape_sql_string(source));
+
+        let mut results = self
+            .nodes
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?;
+
+        let mut nodes = Vec::new();
+        while let Some(batch) = results.try_next().await? {
+            nodes.extend(batch_to_nodes(&batch)?);
+        }
+        Ok(nodes)
+    }
 }
 
 fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {
@@ -252,6 +260,8 @@ fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {
         .as_ref()
         .map(|m| m.to_string())]);
     let namespaces = StringArray::from(vec![node.namespace.as_str()]);
+    let chunk_simhashes = Int64Array::from(vec![node.chunk_simhash]);
+    let chunk_indices = Int32Array::from(vec![node.chunk_index]);
 
     let batch = RecordBatch::try_new(
         nodes_schema(),
@@ -265,6 +275,8 @@ fn node_to_batch(node: &Node) -> Result<RecordBatch, lancedb::Error> {
             Arc::new(confidences),
             Arc::new(metadata),
             Arc::new(namespaces),
+            Arc::new(chunk_simhashes),
+            Arc::new(chunk_indices),
         ],
     )
     .map_err(|e| lancedb::Error::Arrow { source: e })?;
@@ -342,6 +354,14 @@ fn batch_to_nodes(batch: &RecordBatch) -> Result<Vec<Node>, lancedb::Error> {
         .column_by_name("namespace")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
+    // chunk_simhash and chunk_index columns (for incremental processing)
+    let chunk_simhash_col = batch
+        .column_by_name("chunk_simhash")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let chunk_index_col = batch
+        .column_by_name("chunk_index")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+
     let mut nodes = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         let embedding_array = embeddings.value(i);
@@ -366,6 +386,11 @@ fn batch_to_nodes(batch: &RecordBatch) -> Result<Vec<Node>, lancedb::Error> {
             .map(|col| col.value(i).to_string())
             .unwrap_or_else(|| "personal".to_string());
 
+        let chunk_simhash = chunk_simhash_col
+            .and_then(|col| if col.is_null(i) { None } else { Some(col.value(i)) });
+        let chunk_index = chunk_index_col
+            .and_then(|col| if col.is_null(i) { None } else { Some(col.value(i)) });
+
         let node = Node {
             id: ids
                 .value(i)
@@ -389,6 +414,8 @@ fn batch_to_nodes(batch: &RecordBatch) -> Result<Vec<Node>, lancedb::Error> {
             confidence: confidences.value(i),
             metadata,
             namespace,
+            chunk_simhash,
+            chunk_index,
         };
         nodes.push(node);
     }

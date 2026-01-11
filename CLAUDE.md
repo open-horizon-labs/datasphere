@@ -76,6 +76,8 @@ src/
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `EMBEDDING_DIM` | 1536 | text-embedding-3-small dimensions |
+| `CHUNK_THRESHOLD_TOKENS` | 50000 | Above this, session is chunked |
+| `MAX_CHUNK_TOKENS` | 40000 | Max tokens per chunk |
 | `SIMHASH_CHANGE_THRESHOLD` | 10 | Bits changed to trigger re-process |
 | `JOB_DELAY_MS` | 500 | Rate limiting between jobs |
 

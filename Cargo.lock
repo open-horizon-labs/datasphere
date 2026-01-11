@@ -1708,6 +1708,7 @@ dependencies = [
  "tempfile",
  "tiktoken-rs",
  "tokio",
+ "tokio-util",
  "uuid",
  "walkdir",
  "which",
