@@ -244,7 +244,6 @@ async fn call_anthropic(
             .post(ANTHROPIC_API_URL)
             .header("x-api-key", &api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
-            .header("anthropic-beta", "prompt-caching-2024-07-31")
             .header("Content-Type", "application/json")
             .json(&request)
             .send() => {

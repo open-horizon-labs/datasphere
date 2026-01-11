@@ -431,7 +431,7 @@ impl BatchQueue {
             .post(ANTHROPIC_BATCH_URL)
             .header("x-api-key", &api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
-            .header("anthropic-beta", "message-batches-2024-09-24,prompt-caching-2024-07-31")
+            .header("anthropic-beta", "message-batches-2024-09-24")
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
