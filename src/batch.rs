@@ -567,10 +567,15 @@ impl BatchQueue {
             .await
             .map_err(|e| BatchError::RequestFailed(e.to_string()))?;
 
+        let status = response.status();
         let body = response
             .text()
             .await
             .map_err(|e| BatchError::RequestFailed(e.to_string()))?;
+
+        if !status.is_success() {
+            return Err(BatchError::ApiError(format!("{}: {}", status, body)));
+        }
 
         let mut results = Vec::new();
 
