@@ -11,10 +11,7 @@ pub mod watch;
 
 pub use batch::{BatchError, BatchQueue, BatchRequest, BatchResultItem, PendingBatch};
 pub use core::{Node, SourceType, EMBEDDING_DIM};
-pub use distill::{
-    chunk_transcript, distill_chunk, extract_knowledge, DistillMode, ExtractedInsight,
-    ExtractionResult, CHUNK_THRESHOLD_TOKENS, EXTRACTION_SYSTEM_PROMPT,
-};
+pub use distill::{chunk_transcript, count_tokens, EXTRACTION_SYSTEM_PROMPT, MIN_CONTENT_LEN};
 pub use llm::{resolve_anthropic_model, LlmError, LlmResult};
 pub use embed::{chunk_text, embed, EmbedError};
 pub use queue::{Job, JobStatus, Queue};

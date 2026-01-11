@@ -1,12 +1,12 @@
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use datasphere::{
-    chunk_text, chunk_transcript, discover_sessions, discover_sessions_in_dir, distill_chunk,
+    chunk_text, chunk_transcript, discover_sessions, discover_sessions_in_dir,
     embed, list_all_projects, read_transcript, resolve_anthropic_model, AllProjectsWatcher,
     BatchQueue, EmbedError, Job, JobStatus, LlmError, Node, Processed, Queue, SessionInfo,
     SourceType, Store,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::path::PathBuf;
@@ -40,17 +40,6 @@ enum Commands {
         /// Custom database path (defaults to ~/.datasphere/db)
         #[arg(long)]
         db: Option<PathBuf>,
-    },
-
-    /// Scan and distill transcripts (one-shot)
-    Scan {
-        /// Maximum number of transcripts to process (newest first)
-        #[arg(short, long)]
-        limit: Option<usize>,
-
-        /// Project path to scan (defaults to current directory)
-        #[arg(short, long)]
-        project: Option<PathBuf>,
     },
 
     /// Start the daemon (watches all projects)
@@ -138,7 +127,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum QueueAction {
-    /// Show queue counts (default)
+    /// Show queue counts and batch status (default)
     Status,
     /// List pending jobs
     Pending,
@@ -153,6 +142,19 @@ enum QueueAction {
         /// Specific job source_id to retry (retries all if omitted)
         source_id: Option<String>,
     },
+    /// Add a session to the batch queue for processing
+    Add {
+        /// Path to project directory (uses current directory if omitted)
+        #[arg(short, long)]
+        project: Option<PathBuf>,
+        /// Maximum sessions to queue (newest first)
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
+    /// Force submit queued requests to batch API
+    Submit,
+    /// Force poll for batch results
+    Poll,
 }
 
 /// Get the default database path
@@ -440,23 +442,31 @@ fn transcript_has_content(path: &std::path::Path) -> bool {
 
 /// Result type for process_session
 enum ProcessResult {
-    /// Session was processed immediately, created N nodes
-    Processed(usize),
     /// Session was skipped (empty or unchanged)
     Skipped,
     /// Session was queued for batch processing
     QueuedForBatch,
 }
 
-/// Process a single session transcript with incremental chunk processing
-/// AIDEV-NOTE: Compares per-chunk simhashes to only re-distill changed chunks.
+/// Process a single session transcript by queueing to batch
+/// AIDEV-NOTE: All distillation goes through batch API for 50% cost savings.
+/// Compares simhash to skip unchanged sessions.
 /// Returns ProcessResult indicating what happened
 async fn process_session(
     store: &Store,
     session: &SessionInfo,
-    cancel_token: &CancellationToken,
-    _batch_queue: Option<Arc<Mutex<BatchQueue>>>,
+    _cancel_token: &CancellationToken,
+    batch_queue: Option<Arc<Mutex<BatchQueue>>>,
 ) -> Result<ProcessResult, ProcessError> {
+    // Batch queue is required for processing
+    let batch_queue = match batch_queue {
+        Some(q) => q,
+        None => {
+            dlog!("  No batch queue available, skipping");
+            return Ok(ProcessResult::Skipped);
+        }
+    };
+
     dlog!("  Reading transcript...");
 
     // Parse transcript
@@ -519,206 +529,37 @@ async fn process_session(
         }
 
         dlog!(
-            "  Session changed (simhash distance: {} bits), checking chunks...",
+            "  Session changed (simhash distance: {} bits), queueing for batch...",
             hamming
         );
     }
 
-    // Chunk the transcript and compute per-chunk simhashes
+    // Chunk the transcript
     let chunks = chunk_transcript(&context);
-    let chunk_simhashes: Vec<i64> = chunks
-        .iter()
-        .map(|chunk| simhash::simhash(chunk) as i64)
-        .collect();
+    let total_chunks = chunks.len();
 
-    dlog!("  Split into {} chunk(s)", chunks.len());
+    dlog!("  Queueing {} chunk(s) for batch processing...", total_chunks);
 
-    // Get existing nodes for this session (for incremental comparison)
-    let existing_nodes = store.get_nodes_by_source(&session.session_id).await?;
-
-    // Build lookup maps for existing chunks:
-    // 1. chunk_index -> node (primary, more reliable)
-    // 2. simhash -> nodes (fallback for shifted boundaries)
-    // AIDEV-NOTE: Prefer chunk_index matching to avoid simhash collision mis-association
-    let mut existing_by_index: HashMap<i32, &Node> = HashMap::new();
-    let mut existing_by_simhash: HashMap<i64, Vec<&Node>> = HashMap::new();
-    for node in &existing_nodes {
-        if let Some(chunk_index) = node.chunk_index {
-            existing_by_index.insert(chunk_index, node);
+    // Queue all chunks for batch processing
+    {
+        let mut bq = batch_queue.lock().await;
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let chunk_simhash = simhash::simhash(&chunk) as i64;
+            bq.add_chunk(
+                session.session_id.clone(),
+                datasphere::EXTRACTION_SYSTEM_PROMPT.to_string(),
+                format!("TRANSCRIPT CHUNK {}/{}:\n{}", i + 1, total_chunks, chunk),
+                chunk_simhash,
+                Some(i),
+                Some(total_chunks),
+            ).map_err(|e| ProcessError::Other(format!("Failed to queue batch: {}", e)))?;
         }
-        if let Some(chunk_simhash) = node.chunk_simhash {
-            existing_by_simhash
-                .entry(chunk_simhash)
-                .or_default()
-                .push(node);
-        }
+        // Persist queue state immediately
+        bq.save_state().map_err(|e| ProcessError::Other(format!("Failed to save batch state: {}", e)))?;
     }
 
-    // Determine which chunks need distillation (new or changed)
-    let mut chunks_to_distill: Vec<(usize, &str, i64)> = Vec::new();
-    let mut kept_node_ids: HashSet<Uuid> = HashSet::new();
-    let mut new_chunk_simhashes: HashSet<i64> = HashSet::new();
-
-    for (i, (chunk, &chunk_simhash)) in chunks.iter().zip(chunk_simhashes.iter()).enumerate() {
-        new_chunk_simhashes.insert(chunk_simhash);
-        let chunk_idx = i as i32;
-
-        // Try matching by chunk_index first (more reliable)
-        if let Some(node) = existing_by_index.get(&chunk_idx) {
-            if node.chunk_simhash == Some(chunk_simhash) {
-                // Same index, same content - keep existing node
-                kept_node_ids.insert(node.id);
-                dlog!("    Chunk {} unchanged (index match, simhash {:016x})", i + 1, chunk_simhash as u64);
-                continue;
-            }
-        }
-
-        // Fallback: match by simhash (handles shifted boundaries)
-        if let Some(nodes) = existing_by_simhash.get(&chunk_simhash) {
-            // Take first matching node not already kept
-            if let Some(node) = nodes.iter().find(|n| !kept_node_ids.contains(&n.id)) {
-                kept_node_ids.insert(node.id);
-                dlog!("    Chunk {} unchanged (simhash match {:016x}, was index {})",
-                    i + 1, chunk_simhash as u64, node.chunk_index.unwrap_or(-1));
-                continue;
-            }
-        }
-
-        // New or changed chunk - needs distillation
-        chunks_to_distill.push((i, chunk, chunk_simhash));
-    }
-
-    // Collect orphaned node IDs (chunks that no longer exist)
-    // AIDEV-NOTE: Defer deletion until after successful insert to avoid data loss on failure
-    let orphan_node_ids: Vec<Uuid> = existing_nodes
-        .iter()
-        .filter(|node| !kept_node_ids.contains(&node.id))
-        .map(|node| node.id)
-        .collect();
-
-    if chunks_to_distill.is_empty() {
-        dlog!("  All chunks unchanged, keeping {} existing node(s)", kept_node_ids.len());
-
-        // Delete old processed record if it exists (will re-create with updated info)
-        if existing_processed.is_some() {
-            store.delete_processed(&session.session_id).await?;
-        }
-
-        // Re-record as processed with current simhash
-        let node_ids: Vec<String> = kept_node_ids.iter().map(|id| id.to_string()).collect();
-        let record = Processed {
-            source_id: session.session_id.clone(),
-            source_type: "session".to_string(),
-            simhash: current_simhash,
-            processed_at: Utc::now(),
-            node_count: node_ids.len() as i32,
-            node_ids,
-        };
-        store.insert_processed(&record).await?;
-
-        // Now safe to delete orphaned nodes (new record already saved)
-        if !orphan_node_ids.is_empty() {
-            store.delete_nodes(&orphan_node_ids).await?;
-            dlog!("  Deleted {} orphaned node(s)", orphan_node_ids.len());
-        }
-
-        return Ok(ProcessResult::Processed(0)); // 0 new nodes created
-    }
-
-    dlog!(
-        "  Distilling {} changed chunk(s), keeping {} unchanged...",
-        chunks_to_distill.len(),
-        kept_node_ids.len()
-    );
-
-    // Distill changed chunks
-    let distill_start = Instant::now();
-    let mut new_node_ids: Vec<String> = Vec::new();
-    let total_to_distill = chunks_to_distill.len();
-
-    for (processed, (chunk_idx, chunk, chunk_simhash)) in chunks_to_distill.into_iter().enumerate() {
-        // Distill the chunk
-        match distill_chunk(chunk, cancel_token).await {
-            Ok(Some(insight)) => {
-                // Embed and store
-                let embed_start = Instant::now();
-                let embedding = embed(&insight.content, cancel_token).await?;
-                dlog!(
-                    "    Chunk {} distilled + embedded in {:.1}s ({}/{})",
-                    chunk_idx + 1,
-                    embed_start.elapsed().as_secs_f32(),
-                    processed + 1,
-                    total_to_distill
-                );
-
-                let node = Node::with_chunk(
-                    insight.content,
-                    session.session_id.clone(),
-                    SourceType::Session,
-                    embedding,
-                    insight.confidence,
-                    "personal".to_string(),
-                    chunk_simhash,
-                    chunk_idx as i32,
-                );
-                let node_id = node.id.to_string();
-                store.insert_node(&node).await?;
-                new_node_ids.push(node_id);
-            }
-            Ok(None) => {
-                dlog!("    Chunk {} distillation too short, skipping", chunk_idx + 1);
-            }
-            Err(LlmError::RateLimit(msg)) => {
-                return Err(ProcessError::RateLimit(msg));
-            }
-            Err(LlmError::Cancelled) => {
-                return Err(ProcessError::Cancelled);
-            }
-            Err(e) => {
-                dlog!("    Chunk {} distillation failed: {}", chunk_idx + 1, e);
-                // Continue with other chunks
-            }
-        }
-    }
-
-    dlog!("  Distillation completed in {:.1}s", distill_start.elapsed().as_secs_f32());
-
-    // Combine kept and new node IDs
-    let all_node_ids: Vec<String> = kept_node_ids
-        .iter()
-        .map(|id| id.to_string())
-        .chain(new_node_ids.iter().cloned())
-        .collect();
-
-    // Delete old processed record if it exists (before inserting new one)
-    if existing_processed.is_some() {
-        store.delete_processed(&session.session_id).await?;
-    }
-
-    // Record as processed
-    let record = Processed {
-        source_id: session.session_id.clone(),
-        source_type: "session".to_string(),
-        simhash: current_simhash,
-        processed_at: Utc::now(),
-        node_count: all_node_ids.len() as i32,
-        node_ids: all_node_ids,
-    };
-    store.insert_processed(&record).await?;
-
-    // Now safe to delete orphaned nodes (new data already saved)
-    if !orphan_node_ids.is_empty() {
-        store.delete_nodes(&orphan_node_ids).await?;
-        dlog!("  Deleted {} orphaned node(s)", orphan_node_ids.len());
-    }
-
-    dlog!(
-        "  Done! {} new node(s), {} kept, {} total",
-        new_node_ids.len(),
-        kept_node_ids.len(),
-        record.node_count
-    );
-    Ok(ProcessResult::Processed(new_node_ids.len()))
+    dlog!("  Queued {} chunk(s) for batch processing", total_chunks);
+    Ok(ProcessResult::QueuedForBatch)
 }
 
 /// Process completed batch results
@@ -821,9 +662,22 @@ async fn process_batch_results(
         }
 
         // Create Processed records for each session (aggregating all chunks)
+        // AIDEV-NOTE: Must delete orphan nodes when re-processing sessions
         for (session_id, nodes_info) in session_results {
             if nodes_info.is_empty() {
                 continue;
+            }
+
+            // Check for existing processed record to clean up old nodes
+            if let Some(existing) = store.get_processed(&session_id).await? {
+                let old_node_ids: Vec<Uuid> = existing.node_ids.iter()
+                    .filter_map(|id| Uuid::parse_str(id).ok())
+                    .collect();
+                if !old_node_ids.is_empty() {
+                    store.delete_nodes(&old_node_ids).await?;
+                    dlog!("    {} -> deleted {} old node(s)", &session_id[..8.min(session_id.len())], old_node_ids.len());
+                }
+                store.delete_processed(&session_id).await?;
             }
 
             // Use simhash from first chunk (all chunks have same session simhash)
@@ -1005,96 +859,6 @@ async fn process_note(
 
     println!("  Created {} node(s)", node_ids.len());
     Ok(node_ids)
-}
-
-/// Run scan command - one-shot distillation
-async fn run_scan(
-    project: Option<PathBuf>,
-    limit: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let project_path = project.unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
-
-    println!("ds scan");
-    println!("===========");
-    println!("Project: {}", project_path.display());
-
-    // Discover sessions
-    println!("\nDiscovering sessions...");
-    let sessions = match discover_sessions(&project_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to discover sessions: {}", e);
-            return Ok(());
-        }
-    };
-
-    if sessions.is_empty() {
-        println!("No sessions found for this project.");
-        return Ok(());
-    }
-
-    // Apply limit
-    let sessions: Vec<SessionInfo> = match limit {
-        Some(n) => sessions.into_iter().take(n).collect(),
-        None => sessions,
-    };
-
-    println!("Found {} session(s) to process", sessions.len());
-    if let Some(n) = limit {
-        println!("(limited to {} newest)", n);
-    }
-
-    // Open store
-    let db_path = default_db_path();
-    println!("\nDatabase: {}", db_path.display());
-    let store = Store::open(db_path.to_str().unwrap()).await?;
-
-    // Create a cancel token for one-shot scan (won't be cancelled)
-    let cancel_token = CancellationToken::new();
-
-    // Process each session
-    let mut total_nodes = 0;
-    let mut skipped = 0;
-    let mut failed = 0;
-
-    for (i, session) in sessions.iter().enumerate() {
-        println!(
-            "\n[{}/{}] Session: {} ({})",
-            i + 1,
-            sessions.len(),
-            &session.session_id[..8],
-            format_size(session.size_bytes)
-        );
-
-        match process_session(&store, session, &cancel_token, None).await {
-            Ok(ProcessResult::Processed(nodes)) => {
-                total_nodes += nodes;
-            }
-            Ok(ProcessResult::Skipped) => {
-                skipped += 1;
-            }
-            Ok(ProcessResult::QueuedForBatch) => {
-                // Scan mode doesn't use batching, this shouldn't happen
-                eprintln!("  Unexpectedly queued for batch");
-            }
-            Err(e) => {
-                eprintln!("  Error: {}", e);
-                failed += 1;
-            }
-        }
-    }
-
-    // Summary
-    println!("\n-----------");
-    println!("Scan complete!");
-    println!("  Processed: {} sessions", sessions.len() - skipped - failed);
-    println!("  Skipped:   {} (already processed)", skipped);
-    println!("  Failed:    {}", failed);
-    println!("  Nodes:     {} created", total_nodes);
-
-    Ok(())
 }
 
 /// Delay between processing jobs (rate limiting)
@@ -1347,7 +1111,6 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
 
     // Stats
     let mut queued_count = 0;
-    let mut processed_count = 0;
     let mut total_nodes = 0;
     let mut batched_count = 0;
 
@@ -1473,19 +1236,6 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             match process_session(&store, &session, &cancel_token, Some(Arc::clone(&batch_queue))).await {
-                Ok(ProcessResult::Processed(nodes)) => {
-                    // Success - reset backoff on successful processing
-                    if rate_limit_backoff_secs > 0 {
-                        dlog!("[RATE_LIMIT] Success after backoff, resetting backoff state");
-                        rate_limit_backoff_secs = 0;
-                    }
-
-                    if let Err(e) = queue.mark_done(&job.source_id) {
-                        dlog!("  Failed to mark done: {}", e);
-                    }
-                    processed_count += 1;
-                    total_nodes += nodes;
-                }
                 Ok(ProcessResult::Skipped) => {
                     // Already processed or empty
                     if let Err(e) = queue.mark_done(&job.source_id) {
@@ -1615,14 +1365,13 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
 
     dlog!("\nDaemon stopped.");
     dlog!("  Queued:    {} sessions", queued_count);
-    dlog!("  Processed: {} sessions", processed_count);
     dlog!("  Batched:   {} sessions", batched_count);
     dlog!("  Nodes:     {} created", total_nodes);
     Ok(())
 }
 
 /// Run queue command - show/manage job queue
-fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Error>> {
     let queue = Queue::open_default().map_err(|e| format!("Failed to open queue: {}", e))?;
 
     match action.unwrap_or(QueueAction::Status) {
@@ -1630,10 +1379,26 @@ fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Erro
             let (pending, processing, done, failed) = queue.counts()?;
             println!("ds queue");
             println!("============");
-            println!("Pending:    {}", pending);
-            println!("Processing: {}", processing);
-            println!("Done:       {}", done);
-            println!("Failed:     {}", failed);
+            println!("Job Queue:");
+            println!("  Pending:    {}", pending);
+            println!("  Processing: {}", processing);
+            println!("  Done:       {}", done);
+            println!("  Failed:     {}", failed);
+
+            // Also show batch queue status
+            let batch_state_path = dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".datasphere")
+                .join("batch_queue.jsonl");
+            let mut batch_queue = BatchQueue::new(
+                resolve_anthropic_model("sonnet").to_string(),
+                batch_state_path,
+            );
+            if batch_queue.load_state().is_ok() {
+                println!("\nBatch Queue:");
+                println!("  Queued:     {}", batch_queue.queued_request_count());
+                println!("  Pending:    {} batch(es)", batch_queue.pending_batch_count());
+            }
         }
 
         QueueAction::Pending => {
@@ -1698,7 +1463,242 @@ fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error::Erro
                 }
             }
         }
+
+        QueueAction::Add { project, limit } => {
+            run_queue_add(project, limit).await?;
+        }
+
+        QueueAction::Submit => {
+            run_queue_submit().await?;
+        }
+
+        QueueAction::Poll => {
+            run_queue_poll().await?;
+        }
     }
+
+    Ok(())
+}
+
+/// Add sessions to batch queue for processing
+async fn run_queue_add(
+    project: Option<PathBuf>,
+    limit: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project_path = project.unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    });
+
+    println!("ds queue add");
+    println!("===========");
+    println!("Project: {}", project_path.display());
+
+    // Discover sessions
+    println!("\nDiscovering sessions...");
+    let sessions = match discover_sessions(&project_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to discover sessions: {}", e);
+            return Ok(());
+        }
+    };
+
+    if sessions.is_empty() {
+        println!("No sessions found for this project.");
+        return Ok(());
+    }
+
+    // Apply limit
+    let sessions: Vec<SessionInfo> = match limit {
+        Some(n) => sessions.into_iter().take(n).collect(),
+        None => sessions,
+    };
+
+    println!("Found {} session(s)", sessions.len());
+
+    // Open store to check what's already processed
+    let db_path = default_db_path();
+    let store = Store::open(db_path.to_str().unwrap()).await?;
+
+    // Initialize batch queue
+    let batch_state_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".datasphere")
+        .join("batch_queue.jsonl");
+    let mut batch_queue = BatchQueue::new(
+        resolve_anthropic_model("sonnet").to_string(),
+        batch_state_path,
+    );
+    batch_queue.load_state().ok();
+
+    // Queue each session
+    let mut queued = 0;
+    let mut skipped = 0;
+
+    for session in &sessions {
+        // Parse transcript
+        let entries = match read_transcript(&session.transcript_path) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("  {} - error reading: {}", &session.session_id[..8], e);
+                continue;
+            }
+        };
+
+        if entries.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Get messages
+        let messages: Vec<_> = entries
+            .iter()
+            .filter(|e| e.is_message() || e.is_summary())
+            .collect();
+
+        if messages.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Format context
+        let context = datasphere::format_context(&messages);
+        if context.trim().is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Compute simhash
+        let current_simhash = simhash::simhash(&context) as i64;
+
+        // Check if already processed (unchanged)
+        if let Ok(Some(existing)) = store.get_processed(&session.session_id).await {
+            let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
+            if hamming <= SIMHASH_CHANGE_THRESHOLD {
+                println!("  {} - unchanged, skipping", &session.session_id[..8]);
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // Chunk and queue
+        let chunks = chunk_transcript(&context);
+        let total_chunks = chunks.len();
+
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let chunk_simhash = simhash::simhash(&chunk) as i64;
+            batch_queue.add_chunk(
+                session.session_id.clone(),
+                datasphere::EXTRACTION_SYSTEM_PROMPT.to_string(),
+                format!("TRANSCRIPT CHUNK {}/{}:\n{}", i + 1, total_chunks, chunk),
+                chunk_simhash,
+                Some(i),
+                Some(total_chunks),
+            )?;
+        }
+
+        println!("  {} - queued {} chunk(s)", &session.session_id[..8], total_chunks);
+        queued += 1;
+    }
+
+    // Save batch queue state
+    batch_queue.save_state()?;
+
+    println!("\n-----------");
+    println!("Queued:  {} session(s)", queued);
+    println!("Skipped: {} (empty or unchanged)", skipped);
+    println!("\nBatch queue: {} request(s)", batch_queue.queued_request_count());
+    println!("Run 'ds queue submit' to submit to Anthropic API");
+
+    Ok(())
+}
+
+/// Force submit batch queue to Anthropic API
+async fn run_queue_submit() -> Result<(), Box<dyn std::error::Error>> {
+    println!("ds queue submit");
+    println!("===============");
+
+    // Initialize batch queue
+    let batch_state_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".datasphere")
+        .join("batch_queue.jsonl");
+    let mut batch_queue = BatchQueue::new(
+        resolve_anthropic_model("sonnet").to_string(),
+        batch_state_path,
+    );
+    batch_queue.load_state()?;
+
+    let queued = batch_queue.queued_request_count();
+    if queued == 0 {
+        println!("No requests to submit.");
+        return Ok(());
+    }
+
+    println!("Submitting {} request(s)...", queued);
+
+    match batch_queue.submit().await {
+        Ok(batch_id) => {
+            println!("Submitted batch: {}", batch_id);
+            println!("\nBatch queue: {} request(s) remaining", batch_queue.queued_request_count());
+            println!("Pending batches: {}", batch_queue.pending_batch_count());
+            println!("\nRun 'ds queue poll' to check for results");
+        }
+        Err(e) => {
+            eprintln!("Submit failed: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Force poll for batch results
+async fn run_queue_poll() -> Result<(), Box<dyn std::error::Error>> {
+    println!("ds queue poll");
+    println!("=============");
+
+    // Initialize batch queue
+    let batch_state_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".datasphere")
+        .join("batch_queue.jsonl");
+    let batch_queue = Arc::new(Mutex::new(BatchQueue::new(
+        resolve_anthropic_model("sonnet").to_string(),
+        batch_state_path,
+    )));
+
+    {
+        let mut bq = batch_queue.lock().await;
+        bq.load_state()?;
+        let pending = bq.pending_batch_count();
+        if pending == 0 {
+            println!("No pending batches to poll.");
+            return Ok(());
+        }
+        println!("Polling {} pending batch(es)...", pending);
+    }
+
+    // Open store for results processing
+    let db_path = default_db_path();
+    let store = Store::open(db_path.to_str().unwrap()).await?;
+    let cancel_token = CancellationToken::new();
+
+    // Process batch results
+    match process_batch_results(&store, &batch_queue, &cancel_token).await {
+        Ok(nodes) => {
+            if nodes > 0 {
+                println!("\nCreated {} node(s) from batch results", nodes);
+            } else {
+                println!("\nNo completed batches yet. Check again later.");
+            }
+        }
+        Err(e) => {
+            eprintln!("Poll failed: {}", e);
+        }
+    }
+
+    let bq = batch_queue.lock().await;
+    println!("\nPending batches: {}", bq.pending_batch_count());
 
     Ok(())
 }
@@ -1912,10 +1912,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Scan { limit, project } => {
-            run_scan(project, limit).await?;
-        }
-
         Commands::Start { foreground } => {
             if foreground {
                 run_start_foreground().await?;
@@ -1933,7 +1929,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Queue { action } => {
-            run_queue(action)?;
+            run_queue(action).await?;
         }
 
         Commands::Add { file } => {
