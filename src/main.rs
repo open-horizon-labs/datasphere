@@ -744,15 +744,16 @@ async fn process_batch_results(
                             // Embed the distilled content
                             let embedding = embed(trimmed, cancel_token).await?;
 
-                            // Create and store node
-                            // AIDEV-NOTE: Batch processing creates nodes without chunk metadata
-                            // because the whole transcript is distilled as one unit
-                            let node = Node::new(
+                            // Create and store node with chunk metadata
+                            let node = Node::with_chunk(
                                 trimmed.to_string(),
                                 session_id.clone(),
                                 SourceType::Session,
                                 embedding,
                                 1.0,
+                                "personal".to_string(),
+                                simhash,
+                                chunk_index.unwrap_or(0) as i32,
                             );
                             let node_id = node.id.to_string();
                             store.insert_node(&node).await?;
