@@ -361,7 +361,8 @@ impl BatchQueue {
         }
 
         // Submit if oldest request is too old
-        if let Some(oldest) = self.requests.first() {
+        // Note: Use min_by_key instead of first() because re-queued requests go to end
+        if let Some(oldest) = self.requests.iter().min_by_key(|r| r.queued_at) {
             let age = Utc::now().signed_duration_since(oldest.queued_at);
             if age.num_seconds() >= BATCH_MAX_AGE_SECS {
                 return true;
