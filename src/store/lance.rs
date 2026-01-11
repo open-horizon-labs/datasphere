@@ -11,6 +11,12 @@ use uuid::Uuid;
 use crate::core::{Node, SourceType, EMBEDDING_DIM};
 use super::schema::{nodes_schema, processed_schema};
 
+/// Escape single quotes for SQL filter strings by doubling them.
+/// This prevents SQL injection in LanceDB filter expressions.
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Record of a processed source (session or file)
 /// AIDEV-NOTE: source_id is the key (session UUID or canonical file path).
 /// source_type distinguishes sessions from files. node_ids tracks all created nodes.
@@ -117,7 +123,7 @@ impl Store {
 
     /// Get processed record by source_id
     pub async fn get_processed(&self, source_id: &str) -> Result<Option<Processed>, lancedb::Error> {
-        let filter = format!("source_id = '{}'", source_id);
+        let filter = format!("source_id = '{}'", escape_sql_string(source_id));
 
         let mut results = self
             .processed
@@ -146,7 +152,7 @@ impl Store {
 
     /// Delete processed record by source_id (for re-processing)
     pub async fn delete_processed(&self, source_id: &str) -> Result<(), lancedb::Error> {
-        let filter = format!("source_id = '{}'", source_id);
+        let filter = format!("source_id = '{}'", escape_sql_string(source_id));
         self.processed.delete(&filter).await?;
         Ok(())
     }
@@ -216,7 +222,7 @@ impl Store {
     /// Get all nodes for a given source (session or file)
     /// AIDEV-NOTE: Used for incremental chunk processing - compare existing chunk simhashes
     pub async fn get_nodes_by_source(&self, source: &str) -> Result<Vec<Node>, lancedb::Error> {
-        let filter = format!("source = '{}'", source);
+        let filter = format!("source = '{}'", escape_sql_string(source));
 
         let mut results = self
             .nodes
