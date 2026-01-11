@@ -11,7 +11,7 @@
 //! 4. Download and process results
 
 use chrono::{DateTime, Utc};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -487,66 +487,88 @@ impl BatchQueue {
 
     /// Poll all pending batches for completion
     /// Returns completed batches with their results
+    ///
+    /// On transient errors, batches remain in pending state for retry.
+    /// Only successfully fetched results cause batch removal.
     pub async fn poll_pending(&mut self) -> Result<Vec<(PendingBatch, Vec<BatchResultItem>)>, BatchError> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| BatchError::MissingApiKey)?;
 
         let client = Client::new();
         let mut completed = Vec::new();
-        let mut still_pending = Vec::new();
-        let mut to_fetch: Vec<(PendingBatch, String)> = Vec::new();
+        let mut indices_to_remove = Vec::new();
 
-        // First pass: check status of all batches
-        let batches: Vec<_> = self.pending_batches.drain(..).collect();
-        for batch in batches {
+        // Process each batch, tracking which ones complete successfully
+        for (idx, batch) in self.pending_batches.iter().enumerate() {
             let url = format!("{}/{}", ANTHROPIC_BATCH_URL, batch.batch_id);
 
-            let response = client
+            let response = match client
                 .get(&url)
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", ANTHROPIC_API_VERSION)
                 .header("anthropic-beta", "message-batches-2024-09-24")
                 .send()
                 .await
-                .map_err(|e| BatchError::RequestFailed(e.to_string()))?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Network error polling batch {}: {}", batch.batch_id, e);
+                    continue;
+                }
+            };
 
-            if response.status() == 404 {
-                // Batch not found, skip it
+            if response.status() == StatusCode::NOT_FOUND {
+                eprintln!("Batch {} not found (expired or invalid), removing", batch.batch_id);
+                indices_to_remove.push(idx);
                 continue;
             }
 
-            let body = response
-                .text()
-                .await
-                .map_err(|e| BatchError::RequestFailed(e.to_string()))?;
+            let body = match response.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("Read error polling batch {}: {}", batch.batch_id, e);
+                    continue;
+                }
+            };
 
-            let parsed: ApiBatchResponse = serde_json::from_str(&body)
-                .map_err(|e| BatchError::ParseError(format!("{}: {}", e, body)))?;
+            let parsed: ApiBatchResponse = match serde_json::from_str(&body) {
+                Ok(p) => p,
+                Err(e) => {
+                    let preview: String = body.chars().take(200).collect();
+                    eprintln!("Parse error polling batch {}: {} (body: {})", batch.batch_id, e, preview);
+                    continue;
+                }
+            };
 
             match parsed.processing_status.as_str() {
                 "ended" => {
-                    // Queue for result fetching
                     if let Some(results_url) = parsed.results_url {
-                        to_fetch.push((batch, results_url));
+                        // Try to fetch results; only remove batch on success
+                        match Self::fetch_results_static(&client, &api_key, &results_url).await {
+                            Ok(results) => {
+                                completed.push((batch.clone(), results));
+                                indices_to_remove.push(idx);
+                            }
+                            Err(e) => {
+                                eprintln!("Fetch error for batch {}: {}", batch.batch_id, e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Ended but no results URL - remove as there's nothing to fetch
+                        indices_to_remove.push(idx);
                     }
                 }
-                "in_progress" | "canceling" => {
-                    still_pending.push(batch);
-                }
                 _ => {
-                    // Unknown status, keep polling
-                    still_pending.push(batch);
+                    // Still processing or unknown status, keep polling
                 }
             }
         }
 
-        // Second pass: fetch results for completed batches
-        for (batch, results_url) in to_fetch {
-            let results = Self::fetch_results_static(&client, &api_key, &results_url).await?;
-            completed.push((batch, results));
+        // Remove completed/invalid batches in reverse order to preserve indices
+        for idx in indices_to_remove.into_iter().rev() {
+            self.pending_batches.remove(idx);
         }
-
-        self.pending_batches = still_pending;
 
         // Save state
         self.save_state()?;
