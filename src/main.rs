@@ -569,25 +569,21 @@ async fn process_session(
         }
     }
 
-    // Delete orphaned nodes (chunks that no longer exist)
-    let mut deleted_count = 0;
-    for node in &existing_nodes {
-        if !kept_node_ids.contains(&node.id) {
-            store.delete_node(node.id).await?;
-            deleted_count += 1;
-        }
-    }
-    if deleted_count > 0 {
-        dlog!("  Deleted {} orphaned node(s)", deleted_count);
-    }
-
-    // Delete old processed record if it exists (will re-create with updated info)
-    if existing_processed.is_some() {
-        store.delete_processed(&session.session_id).await?;
-    }
+    // Collect orphaned node IDs (chunks that no longer exist)
+    // AIDEV-NOTE: Defer deletion until after successful insert to avoid data loss on failure
+    let orphan_node_ids: Vec<Uuid> = existing_nodes
+        .iter()
+        .filter(|node| !kept_node_ids.contains(&node.id))
+        .map(|node| node.id)
+        .collect();
 
     if chunks_to_distill.is_empty() {
         dlog!("  All chunks unchanged, keeping {} existing node(s)", kept_node_ids.len());
+
+        // Delete old processed record if it exists (will re-create with updated info)
+        if existing_processed.is_some() {
+            store.delete_processed(&session.session_id).await?;
+        }
 
         // Re-record as processed with current simhash
         let node_ids: Vec<String> = kept_node_ids.iter().map(|id| id.to_string()).collect();
@@ -600,6 +596,12 @@ async fn process_session(
             node_ids,
         };
         store.insert_processed(&record).await?;
+
+        // Now safe to delete orphaned nodes (new record already saved)
+        if !orphan_node_ids.is_empty() {
+            store.delete_nodes(&orphan_node_ids).await?;
+            dlog!("  Deleted {} orphaned node(s)", orphan_node_ids.len());
+        }
 
         return Ok(ProcessResult::Processed(0)); // 0 new nodes created
     }
@@ -669,6 +671,11 @@ async fn process_session(
         .chain(new_node_ids.iter().cloned())
         .collect();
 
+    // Delete old processed record if it exists (before inserting new one)
+    if existing_processed.is_some() {
+        store.delete_processed(&session.session_id).await?;
+    }
+
     // Record as processed
     let record = Processed {
         source_id: session.session_id.clone(),
@@ -679,6 +686,12 @@ async fn process_session(
         node_ids: all_node_ids,
     };
     store.insert_processed(&record).await?;
+
+    // Now safe to delete orphaned nodes (new data already saved)
+    if !orphan_node_ids.is_empty() {
+        store.delete_nodes(&orphan_node_ids).await?;
+        dlog!("  Deleted {} orphaned node(s)", orphan_node_ids.len());
+    }
 
     dlog!(
         "  Done! {} new node(s), {} kept, {} total",
@@ -843,8 +856,10 @@ async fn process_file(
     // Compute SimHash
     let current_simhash = simhash::simhash(&content) as i64;
 
-    // Check if already processed
-    if let Some(existing) = store.get_processed(&source_id).await? {
+    // Check if already processed - collect old node IDs but defer deletion
+    // AIDEV-NOTE: Defer deletion until after successful insert to avoid data loss on failure
+    let existing_processed = store.get_processed(&source_id).await?;
+    let old_node_ids: Vec<Uuid> = if let Some(ref existing) = existing_processed {
         let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
 
         if hamming <= SIMHASH_CHANGE_THRESHOLD {
@@ -860,17 +875,14 @@ async fn process_file(
             hamming
         );
 
-        // Delete old nodes, then processed record
-        let node_ids: Vec<Uuid> = existing.node_ids
+        // Collect old node IDs for deferred deletion
+        existing.node_ids
             .iter()
             .filter_map(|id| id.parse::<Uuid>().ok())
-            .collect();
-        if !node_ids.is_empty() {
-            store.delete_nodes(&node_ids).await?;
-            dlog!("  Deleted {} old node(s)", node_ids.len());
-        }
-        store.delete_processed(&source_id).await?;
-    }
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Chunk content if needed
     let chunks = chunk_text(&content);
@@ -896,6 +908,11 @@ async fn process_file(
         node_ids.push(node_id);
     }
 
+    // Delete old processed record if it exists (before inserting new one)
+    if existing_processed.is_some() {
+        store.delete_processed(&source_id).await?;
+    }
+
     // Record as processed
     let record = Processed {
         source_id: source_id.clone(),
@@ -906,6 +923,12 @@ async fn process_file(
         node_ids,
     };
     store.insert_processed(&record).await?;
+
+    // Now safe to delete old nodes (new data already saved)
+    if !old_node_ids.is_empty() {
+        store.delete_nodes(&old_node_ids).await?;
+        dlog!("  Deleted {} old node(s)", old_node_ids.len());
+    }
 
     dlog!("  Done! Created {} node(s)", record.node_count);
     Ok(record.node_count as usize)
