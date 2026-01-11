@@ -257,7 +257,7 @@ pub async fn extract_knowledge(
                     *simhash,
                     Some(i),
                     Some(total_chunks),
-                );
+                ).map_err(|e| llm::LlmError::Other(format!("Failed to queue batch request: {}", e)))?;
             }
         }
 
