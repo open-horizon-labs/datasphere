@@ -445,9 +445,10 @@ impl BatchQueue {
             .map_err(|e| BatchError::RequestFailed(e.to_string()))?;
 
         if !status.is_success() {
-            // Put requests back in queue
-            for req in to_submit {
-                self.requests.push(req);
+            // Put requests back at the front to preserve FIFO order
+            // Insert in reverse so first request ends up at index 0
+            for req in to_submit.into_iter().rev() {
+                self.requests.insert(0, req);
             }
             return Err(BatchError::ApiError(format!("{}: {}", status, body_text)));
         }
@@ -654,5 +655,37 @@ mod tests {
             queue.add(format!("sess_{}", i), "system".to_string(), "message".to_string(), i as i64);
         }
         assert!(queue.should_submit());
+    }
+
+    #[test]
+    fn test_requeue_preserves_fifo_order() {
+        // Simulate failed submission by manually testing the re-queue logic
+        let mut queue = BatchQueue::new("test".to_string(), PathBuf::from("/tmp/test"));
+
+        // Add requests in order
+        queue.add("sess_1".to_string(), "sys".to_string(), "msg1".to_string(), 1);
+        queue.add("sess_2".to_string(), "sys".to_string(), "msg2".to_string(), 2);
+        queue.add("sess_3".to_string(), "sys".to_string(), "msg3".to_string(), 3);
+
+        // Drain first 2 as if for submission
+        let to_submit: Vec<_> = queue.requests.drain(..2).collect();
+        assert_eq!(to_submit.len(), 2);
+        assert_eq!(to_submit[0].session_id, "sess_1");
+        assert_eq!(to_submit[1].session_id, "sess_2");
+
+        // Queue now has only sess_3
+        assert_eq!(queue.requests.len(), 1);
+        assert_eq!(queue.requests[0].session_id, "sess_3");
+
+        // Re-queue failed requests at front (preserving FIFO)
+        for req in to_submit.into_iter().rev() {
+            queue.requests.insert(0, req);
+        }
+
+        // Verify order is preserved: sess_1, sess_2, sess_3
+        assert_eq!(queue.requests.len(), 3);
+        assert_eq!(queue.requests[0].session_id, "sess_1");
+        assert_eq!(queue.requests[1].session_id, "sess_2");
+        assert_eq!(queue.requests[2].session_id, "sess_3");
     }
 }
