@@ -536,15 +536,21 @@ async fn process_session(
     // Get existing nodes for this session (for incremental comparison)
     let existing_nodes = store.get_nodes_by_source(&session.session_id).await?;
 
-    // Build map of existing chunk simhashes -> node IDs
-    // AIDEV-NOTE: Chunks are matched by simhash, not by index (boundaries may shift)
-    let mut existing_by_simhash: HashMap<i64, Vec<Uuid>> = HashMap::new();
+    // Build lookup maps for existing chunks:
+    // 1. chunk_index -> node (primary, more reliable)
+    // 2. simhash -> nodes (fallback for shifted boundaries)
+    // AIDEV-NOTE: Prefer chunk_index matching to avoid simhash collision mis-association
+    let mut existing_by_index: HashMap<i32, &Node> = HashMap::new();
+    let mut existing_by_simhash: HashMap<i64, Vec<&Node>> = HashMap::new();
     for node in &existing_nodes {
+        if let Some(chunk_index) = node.chunk_index {
+            existing_by_index.insert(chunk_index, node);
+        }
         if let Some(chunk_simhash) = node.chunk_simhash {
             existing_by_simhash
                 .entry(chunk_simhash)
                 .or_default()
-                .push(node.id);
+                .push(node);
         }
     }
 
@@ -555,18 +561,31 @@ async fn process_session(
 
     for (i, (chunk, &chunk_simhash)) in chunks.iter().zip(chunk_simhashes.iter()).enumerate() {
         new_chunk_simhashes.insert(chunk_simhash);
+        let chunk_idx = i as i32;
 
-        if let Some(node_ids) = existing_by_simhash.get(&chunk_simhash) {
-            // Chunk unchanged - keep existing node(s)
-            // AIDEV-NOTE: Take first matching node (in case of duplicates)
-            if let Some(&node_id) = node_ids.first() {
-                kept_node_ids.insert(node_id);
-                dlog!("    Chunk {} unchanged (simhash {:016x})", i + 1, chunk_simhash as u64);
+        // Try matching by chunk_index first (more reliable)
+        if let Some(node) = existing_by_index.get(&chunk_idx) {
+            if node.chunk_simhash == Some(chunk_simhash) {
+                // Same index, same content - keep existing node
+                kept_node_ids.insert(node.id);
+                dlog!("    Chunk {} unchanged (index match, simhash {:016x})", i + 1, chunk_simhash as u64);
+                continue;
             }
-        } else {
-            // New or changed chunk - needs distillation
-            chunks_to_distill.push((i, chunk, chunk_simhash));
         }
+
+        // Fallback: match by simhash (handles shifted boundaries)
+        if let Some(nodes) = existing_by_simhash.get(&chunk_simhash) {
+            // Take first matching node not already kept
+            if let Some(node) = nodes.iter().find(|n| !kept_node_ids.contains(&n.id)) {
+                kept_node_ids.insert(node.id);
+                dlog!("    Chunk {} unchanged (simhash match {:016x}, was index {})",
+                    i + 1, chunk_simhash as u64, node.chunk_index.unwrap_or(-1));
+                continue;
+            }
+        }
+
+        // New or changed chunk - needs distillation
+        chunks_to_distill.push((i, chunk, chunk_simhash));
     }
 
     // Collect orphaned node IDs (chunks that no longer exist)
