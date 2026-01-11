@@ -395,8 +395,9 @@ impl BatchQueue {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| BatchError::MissingApiKey)?;
 
-        // Take up to BATCH_MAX_COUNT requests
-        let to_submit: Vec<_> = self.requests.drain(..self.requests.len().min(BATCH_MAX_COUNT)).collect();
+        // Clone requests to submit (don't drain yet - wait for successful response)
+        let submit_count = self.requests.len().min(BATCH_MAX_COUNT);
+        let to_submit: Vec<_> = self.requests[..submit_count].to_vec();
         let request_ids: Vec<_> = to_submit.iter().map(|r| r.custom_id.clone()).collect();
 
         // Build API request
@@ -445,12 +446,11 @@ impl BatchQueue {
             .map_err(|e| BatchError::RequestFailed(e.to_string()))?;
 
         if !status.is_success() {
-            // Put requests back in queue
-            for req in to_submit {
-                self.requests.push(req);
-            }
             return Err(BatchError::ApiError(format!("{}: {}", status, body_text)));
         }
+
+        // Success - now drain the submitted requests from queue
+        self.requests.drain(..submit_count);
 
         let parsed: ApiBatchResponse = serde_json::from_str(&body_text)
             .map_err(|e| BatchError::ParseError(format!("{}: {}", e, body_text)))?;
