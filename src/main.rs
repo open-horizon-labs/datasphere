@@ -1391,7 +1391,7 @@ async fn run_queue(action: Option<QueueAction>) -> Result<(), Box<dyn std::error
                 .join(".datasphere")
                 .join("batch_queue.jsonl");
             let mut batch_queue = BatchQueue::new(
-                resolve_anthropic_model("sonnet").to_string(),
+                resolve_anthropic_model("opus").to_string(),
                 batch_state_path,
             );
             if batch_queue.load_state().is_ok() {
@@ -1526,7 +1526,7 @@ async fn run_queue_add(
         .join(".datasphere")
         .join("batch_queue.jsonl");
     let mut batch_queue = BatchQueue::new(
-        resolve_anthropic_model("sonnet").to_string(),
+        resolve_anthropic_model("opus").to_string(),
         batch_state_path,
     );
     batch_queue.load_state().ok();
@@ -1624,7 +1624,7 @@ async fn run_queue_submit() -> Result<(), Box<dyn std::error::Error>> {
         .join(".datasphere")
         .join("batch_queue.jsonl");
     let mut batch_queue = BatchQueue::new(
-        resolve_anthropic_model("sonnet").to_string(),
+        resolve_anthropic_model("opus").to_string(),
         batch_state_path,
     );
     batch_queue.load_state()?;
@@ -1663,7 +1663,7 @@ async fn run_queue_poll() -> Result<(), Box<dyn std::error::Error>> {
         .join(".datasphere")
         .join("batch_queue.jsonl");
     let batch_queue = Arc::new(Mutex::new(BatchQueue::new(
-        resolve_anthropic_model("sonnet").to_string(),
+        resolve_anthropic_model("opus").to_string(),
         batch_state_path,
     )));
 
