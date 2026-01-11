@@ -2,8 +2,9 @@ use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use datasphere::{
     chunk_text, chunk_transcript, discover_sessions, discover_sessions_in_dir, distill_chunk,
-    embed, list_all_projects, read_transcript, AllProjectsWatcher, BatchQueue, EmbedError, Job,
-    JobStatus, LlmError, Node, Processed, Queue, SessionInfo, SourceType, Store,
+    embed, list_all_projects, read_transcript, resolve_anthropic_model, AllProjectsWatcher,
+    BatchQueue, EmbedError, Job, JobStatus, LlmError, Node, Processed, Queue, SessionInfo,
+    SourceType, Store,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1216,13 +1217,9 @@ async fn run_start_foreground() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize batch queue for large sessions (50% cost savings)
     // AIDEV-NOTE: Sessions >12K tokens are queued for batch API processing
-    // Model IDs must match llm.rs resolve_model() for consistent pricing/behavior
-    let batch_model = match std::env::var("DATASPHERE_MODEL").unwrap_or_else(|_| "opus".to_string()).as_str() {
-        "opus" => "claude-opus-4-5",
-        "sonnet" => "claude-sonnet-4-5",
-        "haiku" => "claude-haiku-4-5",
-        other => other, // Use model name directly if not a shorthand
-    }.to_string();
+    // Uses resolve_anthropic_model() for consistent model IDs with real-time processing
+    let model_env = std::env::var("DATASPHERE_MODEL").unwrap_or_else(|_| "opus".to_string());
+    let batch_model = resolve_anthropic_model(&model_env).to_string();
     let batch_state_path = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".datasphere")

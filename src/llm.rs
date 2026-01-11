@@ -197,7 +197,14 @@ fn get_anthropic_pricing(model: &str) -> (f64, f64) {
 }
 
 /// Map short model names to full Anthropic model IDs
-fn resolve_anthropic_model(model: &str) -> &str {
+///
+/// Converts shorthand names to API-compatible model identifiers:
+/// - "haiku" → "claude-haiku-4-5"
+/// - "sonnet" → "claude-sonnet-4-5"
+/// - "opus" → "claude-opus-4-5"
+///
+/// Full model IDs are passed through unchanged.
+pub fn resolve_anthropic_model(model: &str) -> &str {
     match model {
         "haiku" => "claude-haiku-4-5",
         "sonnet" => "claude-sonnet-4-5",

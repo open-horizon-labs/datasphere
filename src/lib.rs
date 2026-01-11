@@ -15,7 +15,7 @@ pub use distill::{
     chunk_transcript, distill_chunk, extract_knowledge, DistillMode, ExtractedInsight,
     ExtractionResult, CHUNK_THRESHOLD_TOKENS, EXTRACTION_SYSTEM_PROMPT,
 };
-pub use llm::{LlmError, LlmResult};
+pub use llm::{resolve_anthropic_model, LlmError, LlmResult};
 pub use embed::{chunk_text, embed, EmbedError};
 pub use queue::{Job, JobStatus, Queue};
 pub use session::{discover_sessions, discover_sessions_in_dir, list_all_projects, SessionInfo};
