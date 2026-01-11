@@ -541,15 +541,15 @@ async fn process_session(
     dlog!("  Queueing {} chunk(s) for batch processing...", total_chunks);
 
     // Queue all chunks for batch processing
+    // AIDEV-NOTE: Use session-level simhash (not per-chunk) so Processed.simhash matches change detection
     {
         let mut bq = batch_queue.lock().await;
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let chunk_simhash = simhash::simhash(&chunk) as i64;
             bq.add_chunk(
                 session.session_id.clone(),
                 datasphere::EXTRACTION_SYSTEM_PROMPT.to_string(),
                 format!("TRANSCRIPT CHUNK {}/{}:\n{}", i + 1, total_chunks, chunk),
-                chunk_simhash,
+                current_simhash,
                 Some(i),
                 Some(total_chunks),
             ).map_err(|e| ProcessError::Other(format!("Failed to queue batch: {}", e)))?;
@@ -1540,7 +1540,7 @@ async fn run_queue_add(
         let entries = match read_transcript(&session.transcript_path) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("  {} - error reading: {}", &session.session_id[..8], e);
+                eprintln!("  {} - error reading: {}", &session.session_id[..8.min(session.session_id.len())], e);
                 continue;
             }
         };
@@ -1575,29 +1575,29 @@ async fn run_queue_add(
         if let Ok(Some(existing)) = store.get_processed(&session.session_id).await {
             let hamming = simhash::hamming_distance(existing.simhash as u64, current_simhash as u64);
             if hamming <= SIMHASH_CHANGE_THRESHOLD {
-                println!("  {} - unchanged, skipping", &session.session_id[..8]);
+                println!("  {} - unchanged, skipping", &session.session_id[..8.min(session.session_id.len())]);
                 skipped += 1;
                 continue;
             }
         }
 
         // Chunk and queue
+        // AIDEV-NOTE: Use session-level simhash (not per-chunk) so Processed.simhash matches change detection
         let chunks = chunk_transcript(&context);
         let total_chunks = chunks.len();
 
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let chunk_simhash = simhash::simhash(&chunk) as i64;
             batch_queue.add_chunk(
                 session.session_id.clone(),
                 datasphere::EXTRACTION_SYSTEM_PROMPT.to_string(),
                 format!("TRANSCRIPT CHUNK {}/{}:\n{}", i + 1, total_chunks, chunk),
-                chunk_simhash,
+                current_simhash,
                 Some(i),
                 Some(total_chunks),
             )?;
         }
 
-        println!("  {} - queued {} chunk(s)", &session.session_id[..8], total_chunks);
+        println!("  {} - queued {} chunk(s)", &session.session_id[..8.min(session.session_id.len())], total_chunks);
         queued += 1;
     }
 
@@ -1866,7 +1866,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !db_path.exists() {
                 println!("Database not found at: {}", db_path.display());
-                println!("Run 'ds scan' to create the database.");
+                println!("Run 'ds start' or 'ds queue add' to begin processing sessions.");
                 return Ok(());
             }
 
