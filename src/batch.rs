@@ -332,10 +332,11 @@ impl BatchQueue {
         chunk_index: Option<usize>,
         total_chunks: Option<usize>,
     ) {
-        let timestamp = Utc::now().timestamp();
+        // Use nanoseconds to prevent collisions when multiple requests are queued in same second
+        let timestamp_nanos = Utc::now().timestamp_nanos_opt().unwrap_or_else(|| Utc::now().timestamp() * 1_000_000_000);
         let custom_id = match chunk_index {
-            Some(idx) => format!("{}:c{}:{}", session_id, idx, timestamp),
-            None => format!("{}:{}", session_id, timestamp),
+            Some(idx) => format!("{}:c{}:{}", session_id, idx, timestamp_nanos),
+            None => format!("{}:{}", session_id, timestamp_nanos),
         };
         self.requests.push(BatchRequest {
             custom_id,
