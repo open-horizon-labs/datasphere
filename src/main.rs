@@ -1,10 +1,10 @@
 use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use datasphere::{
-    chunk_text, chunk_transcript, discover_sessions, discover_sessions_in_dir, distill_chunk,
-    embed, list_all_projects, read_transcript, resolve_anthropic_model, AllProjectsWatcher,
-    BatchQueue, EmbedError, Job, JobStatus, LlmError, Node, Processed, Queue, SessionInfo,
-    SourceType, Store,
+    chunk_text, chunk_transcript, count_tokens, discover_sessions, discover_sessions_in_dir,
+    distill_chunk, embed, list_all_projects, read_transcript, resolve_anthropic_model,
+    AllProjectsWatcher, BatchQueue, EmbedError, Job, JobStatus, LlmError, Node, Processed, Queue,
+    SessionInfo, SourceType, Store, EXTRACTION_SYSTEM_PROMPT,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -369,6 +369,11 @@ fn dir_size(path: &PathBuf) -> u64 {
 /// AIDEV-NOTE: 10 bits out of 64 (~15%) means meaningful content change
 const SIMHASH_CHANGE_THRESHOLD: u32 = 10;
 
+/// Token threshold for routing sessions to batch processing
+/// AIDEV-NOTE: Sessions >12K tokens are queued for batch API (50% cost savings).
+/// Smaller sessions are processed in real-time for faster feedback.
+const BATCH_ROUTING_THRESHOLD_TOKENS: usize = 12_000;
+
 /// Error type for session processing
 #[derive(Debug)]
 enum ProcessError {
@@ -450,12 +455,13 @@ enum ProcessResult {
 
 /// Process a single session transcript with incremental chunk processing
 /// AIDEV-NOTE: Compares per-chunk simhashes to only re-distill changed chunks.
+/// Large sessions (>12K tokens) are routed to batch processing for 50% cost savings.
 /// Returns ProcessResult indicating what happened
 async fn process_session(
     store: &Store,
     session: &SessionInfo,
     cancel_token: &CancellationToken,
-    _batch_queue: Option<Arc<Mutex<BatchQueue>>>,
+    batch_queue: Option<Arc<Mutex<BatchQueue>>>,
 ) -> Result<ProcessResult, ProcessError> {
     dlog!("  Reading transcript...");
 
@@ -604,13 +610,44 @@ async fn process_session(
         return Ok(ProcessResult::Processed(0)); // 0 new nodes created
     }
 
+    // Check if we should route to batch processing
+    // AIDEV-NOTE: Sessions >12K tokens go to batch API for 50% cost savings.
+    // Small sessions stay real-time for responsiveness.
+    if let Some(ref batch_queue) = batch_queue {
+        let token_count = count_tokens(&context);
+        if token_count > BATCH_ROUTING_THRESHOLD_TOKENS {
+            let total_chunks = chunks_to_distill.len();
+            dlog!(
+                "  Large session ({} tokens, {} chunks to distill), queueing for batch processing",
+                token_count, total_chunks
+            );
+
+            // Queue each chunk to batch
+            {
+                let mut bq = batch_queue.lock().await;
+                for (chunk_idx, chunk, chunk_simhash) in &chunks_to_distill {
+                    bq.add_chunk(
+                        session.session_id.clone(),
+                        EXTRACTION_SYSTEM_PROMPT.to_string(),
+                        format!("TRANSCRIPT CHUNK {}/{}:\n{}", chunk_idx + 1, total_chunks, chunk),
+                        *chunk_simhash,
+                        Some(*chunk_idx),
+                        Some(total_chunks),
+                    );
+                }
+            }
+
+            return Ok(ProcessResult::QueuedForBatch);
+        }
+    }
+
     dlog!(
         "  Distilling {} changed chunk(s), keeping {} unchanged...",
         chunks_to_distill.len(),
         kept_node_ids.len()
     );
 
-    // Distill changed chunks
+    // Distill changed chunks (real-time path for smaller sessions)
     let distill_start = Instant::now();
     let mut new_node_ids: Vec<String> = Vec::new();
     let total_to_distill = chunks_to_distill.len();

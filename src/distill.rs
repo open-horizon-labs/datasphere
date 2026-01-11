@@ -130,8 +130,8 @@ fn get_bpe() -> &'static CoreBPE {
     BPE.get_or_init(|| cl100k_base().expect("Failed to load cl100k_base tokenizer"))
 }
 
-/// Count tokens in text
-fn count_tokens(text: &str) -> usize {
+/// Count tokens in text using cl100k_base tokenizer
+pub fn count_tokens(text: &str) -> usize {
     get_bpe().encode_with_special_tokens(text).len()
 }
 
